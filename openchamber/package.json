@@ -1,0 +1,32 @@
+{
+  "name": "docket-openchamber",
+  "version": "0.1.0",
+  "description": "Docket in OpenChamber: outstanding wakes, who set them, and remove",
+  "private": true,
+  "scripts": {
+    "build": "esbuild panel/main.ts --bundle --format=iife --platform=browser --target=es2022 --outfile=panel/main.js"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "2.3.2",
+    "esbuild": "^0.25.0"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.3.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "docket",
+        "name": "Docket",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "attach": false,
+      "service": {
+        "entry": "service/main.mjs",
+        "runtime": "host"
+      }
+    }
+  }
+}
