@@ -1,0 +1,6 @@
+#!/bin/sh
+# Launcher for the Docket module. No install step: the repo is the install.
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+PY="${DOCKET_PYTHON:-python3.13}"
+exec "$PY" -m docket "$@"

@@ -1,0 +1,9 @@
+node_modules/
+__pycache__/
+*.py[cod]
+*.pyc
+.DS_Store
+*.log
+.venv/
+.pytest_cache/
+wt/

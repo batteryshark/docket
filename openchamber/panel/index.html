@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docket</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--oc-bg); color: var(--oc-fg); font: 13px/1.45 var(--oc-font, system-ui); }
+main { padding: 14px 14px 24px; display: grid; gap: 12px; }
+header { display: flex; align-items: center; gap: 8px; }
+h1 { margin: 0; font-size: 14px; font-weight: 600; }
+header .spacer { flex: 1; }
+.dim { color: var(--oc-muted); font-size: 12px; }
+#notice:empty, #tabs:empty, #list:empty, #loading:empty { display: none; }
+#list { display: grid; gap: 10px; }
+.card { border: 1px solid var(--oc-border); border-radius: var(--oc-radius, 8px); padding: 10px 12px; display: grid; gap: 6px; }
+.top, .meta, .actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.top { justify-content: space-between; }
+.kind { font-weight: 600; }
+.reason { overflow-wrap: anywhere; white-space: pre-wrap; }
+.meta { color: var(--oc-muted); font-size: 12px; }
+.meta span { overflow-wrap: anywhere; }
+.error { color: var(--oc-error-text); font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+#footer { margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Docket</h1>
+    <span class="dim" id="stamp"></span>
+    <span class="spacer"></span>
+    <span id="refresh"></span>
+  </header>
+  <div id="notice"></div>
+  <div id="loading"></div>
+  <div id="tabs"></div>
+  <div id="list"></div>
+  <p class="dim" id="footer"></p>
+</main>
+<script src="main.js"></script>
+</body>
+</html>
