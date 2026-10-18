@@ -37,6 +37,6 @@ Before paired session requests, the adapter checks exactly one matching active
 own client record with no expiry/revocation. Renaming is allowed. Failure is
 visible without fallback. The guard is not a host-enforced capability boundary:
 optional loopback auth and a guard/request race remain. **Live revocation is
-unproven**; synthetic refusal tests are not proof. No live probes or pairing
-are authorized by this staging. Admission/consumption/cancel and browser-safety
-limitations in the root README still apply.
+unproven**; synthetic refusal tests are not proof. Live host delivery and pairing
+also remain unverified. The [README limitations](README.md#known-limitations)
+and its admission/consumption/cancel semantics still apply.
