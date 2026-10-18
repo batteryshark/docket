@@ -21,6 +21,16 @@ expected to finish then. Or it can start a background job and arrange a later
 check-in, or set a regular reminder. A note in a Markdown file does not wake a
 session, and keeping an agent in a model-powered polling loop is unnecessary.
 
+An ad-hoc background polling process can disappear when its harness restarts or
+crashes—or be forgotten and left running. Docket keeps schedules in SQLite,
+separate from the harness's lifetime, and uses bounded watches and recurrences
+rather than forgotten open-ended loops. The CLI gives you one place to inspect
+and cancel schedules; the optional panel is designed to make them visible too,
+but its shipped source is incomplete and not ready to activate. Docket must be
+running to check or deliver, and the target host must be available and compatible:
+persistence is not guaranteed delivery across downtime, and missed recurrence
+intervals coalesce rather than all replaying.
+
 Docket schedules the wake, or checks a bounded watch condition, and asks the
 host to resume the existing compatible session when due. It does not run the
 download or background job itself, and a check-in does not guarantee that work
