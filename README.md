@@ -1,5 +1,10 @@
 # Docket
 
+<p><a href="assets/workstack-mark-full.png"><img src="assets/workstack-mark.png" alt="Docket comic mark" width="160" style="max-width:100%;height:auto;"></a></p>
+
+Reviewed comic mark, locally wired only; not a product capture, native acceptance or release clearance.
+[Small-use Tiny32](assets/workstack-mark-32.png) is a separately designed composition, not a shrunk badge.
+
 A bounded local scheduler that wakes OpenCode sessions with timers, alarms,
 interval recurrence and built-in watches. Includes CLI, loopback HTTP API and
 stdio MCP. The optional OpenChamber panel lists/removes items; it does not
@@ -8,7 +13,7 @@ deliver wakes. Python 3.11+, SQLite, standard-library runtime.
 **Local review staging only.** Original owned source/documentation is MIT under
 [LICENSE](LICENSE); [RIGHTS.md](RIGHTS.md) excludes outside dependencies, vendor
 tools, models, reference/media and binaries and preserves their notice obligations.
-Logos and genuine screenshots await principal selection/capture. Operational
+The reviewed comic mark is locally wired only. The selected panel capture below is included. Other operational
 deployment records and images are intentionally not distributed.
 
 ## Install and run
@@ -137,7 +142,11 @@ dispatches arbitrary worker processes or contacts the principal directly.
 ## Optional panel and validation safety stop
 
 See [openchamber/README.md](openchamber/README.md) for the source-only extension.
-No bundle/icon, extension activation or screenshot is supplied here.
+No bundle/icon or extension activation is supplied here.
+
+![Real full Docket panel at 9:47 PM, Outstanding 0 and Undeliverable 1, service 0.3.0](assets/screenshots/q88-manual-srgb-docket.png)
+
+Owner-provided real full panel read at 9:47 PM: **0 outstanding and 1 undeliverable**, not an empty healthy scheduler. The service 0.3.0 warning says the installed service upgrades separately and the panel does not restart it. This is not delivery, pairing, restart or packaged-extension acceptance. The approved sRGB derivative intentionally color-converted the original RGB; it is included byte-for-byte without another conversion.
 
 **Do not run full discovery, browser, CDP, e2e or evidence scripts.** The inherited
 browser-suite containment issue is unresolved: a browser updater escaped the
