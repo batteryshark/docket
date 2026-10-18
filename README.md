@@ -1,66 +1,41 @@
 # Docket
 
-<p><a href="assets/workstack-mark-full.png"><img src="assets/workstack-mark.png" alt="Docket comic mark" width="160" style="max-width:100%;height:auto;"></a></p>
+<p><a href="assets/workstack-mark-full.png"><img src="assets/workstack-mark.png" alt="Docket: a comic alarm-clock mascot holding a reminder card" width="180"></a></p>
 
-Reviewed comic mark, locally wired only; not a product capture, native acceptance or release clearance.
-[Small-use Tiny32](assets/workstack-mark-32.png) is a separately designed composition, not a shrunk badge.
+**Wake an agent session later, without leaving a polling agent running.**
 
-A bounded local scheduler that wakes OpenCode sessions with timers, alarms,
-interval recurrence and built-in watches. Includes CLI, loopback HTTP API and
-stdio MCP. The optional OpenChamber panel lists/removes items; it does not
-deliver wakes. Python 3.11+, SQLite, standard-library runtime.
+Docket is a bounded local scheduler for OpenCode sessions: timers, alarms,
+interval recurrence and built-in watches. It provides a CLI, a loopback HTTP
+API and stdio MCP, with SQLite persistence and a Python 3.11+ standard-library
+runtime. An optional OpenChamber panel lists and removes items; it does not
+deliver wakes.
 
-**Local review staging only.** Original owned source/documentation is MIT under
-[LICENSE](LICENSE); [RIGHTS.md](RIGHTS.md) excludes outside dependencies, vendor
-tools, models, reference/media and binaries and preserves their notice obligations.
-The reviewed comic mark is locally wired only. The selected panel capture below is included. Other operational
-deployment records and images are intentionally not distributed.
+## Quick start
 
-## Install and run
-
-With Python 3.11+ from a stable checkout, no dependency install is needed:
+From a stable checkout with Python 3.11+:
 
 ```sh
+git clone https://github.com/batteryshark/docket.git
+cd docket
+python3 -m docket --help
 python3 -m docket serve
 ```
 
-This starts a real local scheduler/API, not a dry run. Ctrl-C stops it. The
-default is `http://127.0.0.1:8768`; non-loopback binding is refused. Optional
-editable installation in an isolated virtual environment is `python3 -m pip
-install -e .` and provides `docket`; this requires pip and Hatchling/build
-tooling, separately obtained. No install/build was run for staging.
+No dependency installation is needed to run from source. `serve` starts the
+**real scheduler**, not a dry run, at `http://127.0.0.1:8768`; non-loopback
+binding is refused. Ctrl-C stops it. Review [host setup](#host-setup) before
+scheduling: delivery requires a compatible local host and an existing session.
 
-The source launcher `bin/docket` defaults to `python3.13`; set `DOCKET_PYTHON`
-to an available Python >=3.11 if using it. `python3 -m docket` avoids that
-launcher-specific default. macOS `service install/start/stop/restart/status/
-uninstall` commands manage a user LaunchAgent, not OpenChamber or OpenCode.
-Install starts the job; never run it alongside `serve`. Service installation
-pins the running Python's absolute executable (requires >=3.11, an existing
-executable file), using `-m docket daemon` and the package parent as its working
-directory. It does not call `bin/docket` at startup. `DOCKET_PYTHON` selects the
-interpreter only when entering through that source launcher; with `python -m`,
-the invoked Python is authoritative. Interpreter symlinks are retained for venvs.
-Source/package/interpreter relocation requires a reviewed reinstall.
-Stopping prevents due-time delivery; uninstall
-does not erase state or receipts. Do not run any service command for validation.
+For an installed `docket` command, optionally use an isolated virtual environment
+and `python3 -m pip install -e .`. This requires pip and Hatchling build tooling;
+the editable install has not been validated in this release preparation.
+The source launcher `bin/docket` defaults to `python3.13`; `DOCKET_PYTHON` can
+select another Python >=3.11. `python3 -m docket` uses the invoked interpreter.
 
-The generated plist uses `plistlib`; spaces, `&`, `<` and Unicode are data, not
-shell/XML fragments. It persists only PATH (with standard executable directories
-appended), HOME, USER, LOGNAME, resolved absolute DOCKET_HOME and
-DOCKET_DELIVERY_HOST. State defaults to `~/.docket`; overrides must be nonempty
-absolute or tilde-expanded absolute paths, not relative paths. Logs and daemon
-state use the same resolved directory. Delivery mode defaults to `auto`; accepted
-values are `auto`, `opencode`, `openchamber-paired`, `openchamber-unpaired`.
-Enrollment still takes precedence as described below; this is not a pairing
-bypass. Invalid state/mode/interpreter or unrepresentable plist values refuse
-installation before service calls. No whole environment, token, credential,
-PYTHONPATH or unrelated setting is copied. Changes require reviewed reinstall;
-no existing runtime state is migrated.
+## Schedule a wake
 
-## Usage (after explicit host setup)
-
-`TARGET_SESSION` and `ITEM_ID` below are operator-provided placeholders, not
-bundled live identities. The target must exist on the delivery host.
+After host setup, use another terminal. Set `TARGET_SESSION` to an existing
+session ID and replace `ITEM_ID` with the ID returned by a create command.
 
 ```sh
 python3 -m docket timer --in 20m --session "$TARGET_SESSION" --reason "check progress"
@@ -71,89 +46,114 @@ python3 -m docket occurrences
 python3 -m docket cancel "$ITEM_ID"
 ```
 
-Recurrence needs `count` (1–100) or an `until` within 90 days, with interval
-at least 60s. Missed intervals coalesce rather than replaying every slot.
-Watches need `until`; checks are `file_appears`, `file_stable`, `process_ended`,
-`url_answers`, `session_idle`. File stability means a quiet metadata window,
-not semantic producer completion; URL checks have no custom headers and cannot
-redirect to another origin. Items cannot execute commands/scripts. Context
-is data, not instructions. `--directory` pins target location. Missing,
-archived or wrong-location targets are refused or become undeliverable.
+- Recurrence requires `count` (1–100) or an `until` within 90 days, with an
+  interval of at least 60 seconds. Missed intervals coalesce rather than replay.
+- Watches require `until`. Checks are `file_appears`, `file_stable`,
+  `process_ended`, `url_answers` and `session_idle`; see `python3 -m docket watch --help`.
+  File stability means a quiet metadata window, not semantic producer completion.
+  URL checks have no custom headers and cannot redirect to another origin.
+- `--directory` pins the target location. Missing, archived or wrong-location
+  targets are refused or become undeliverable.
+- Items cannot execute commands or scripts. Context is data, not instructions.
+  Docket neither reserves model quotas nor dispatches arbitrary worker processes
+  or contacts the operator directly. A woken agent may act on its own instructions.
 
-## Admission, consumption and cancellation
+## What delivery means
 
-Default delivery uses `queue`, `resume: true`; urgent uses `steer` at a model
-step boundary, not mid-token interruption. A queued wake does not guarantee
-continuation of an arbitrary multi-step task or separate drain.
+Normal wakes use `queue` with `resume: true`; urgent wakes use `steer` at a model
+step boundary, not mid-token interruption. Queuing does not guarantee continuation
+of an arbitrary multi-step task or a separate drain.
 
-HTTP admission is **not consumption**. Each occurrence persists a stable
-message ID before sending; `delivered` requires that ID in the transcript.
-Unconfirmed retries reuse the ID. Confirmed admissions that later disappear
-are lost/undeliverable, not silently reissued. Ambiguous outcomes remain visible.
-An admitted occurrence blocks the next recurrence until resolved.
+**Admission is not consumption.** Each occurrence persists a stable message ID
+before sending. `delivered` requires that ID in the transcript; unconfirmed
+retries reuse it. Confirmed admissions that later disappear are lost/undeliverable,
+not silently reissued. Ambiguous outcomes remain visible, and an admitted
+occurrence blocks the next recurrence until resolved.
 
-Cancel stops the item/series and attempts to retract its durable admission ID,
-including the sending window. Retraction is best-effort: consumed, missing,
-unreadable, lost or failed-drop outcomes do not claim undo. Cancellation keeps
-occurrence history. Admission-time wake lateness can differ from final lateness
-after queue consumption.
+Cancel stops the item/series and attempts to retract the admission, including
+during sending. Retraction is best-effort: it cannot undo consumed work, and
+missing, unreadable, lost or failed-drop outcomes do not claim undo. Occurrence
+history is retained. Admission-time lateness may differ from final consumption lateness.
 
-## Host setup and pairing limits
+## Host setup
 
-Generic unpaired discovery uses the older official OpenCode service metadata
-and its runtime basic credential, restricted to loopback. Merely sharing a
-transcript database or delivering to an idle session does not prove ownership
-of a busy turn. Host/API compatibility must be reviewed before real scheduling.
+Generic unpaired discovery uses older official OpenCode service metadata and
+its runtime basic credential, restricted to loopback. Host/API compatibility
+must be checked before real scheduling; merely sharing a transcript database
+or delivering to an idle session does not prove ownership of a busy turn.
 
-Optional own-client OpenChamber pairing requires explicit principal consent;
-see [PAIRING.md](PAIRING.md). It grants broad session API access, not a scoped
-wake-only capability. Paired mode uses only Docket's binding, rediscovering the
-desktop loopback port; it does not borrow another client's credential. Missing,
-unreadable, expired, revoked or mismatched binding fails visibly without an
-old-service or unauthenticated fallback. Enrollment state latches host selection.
+Optional OpenChamber own-client pairing requires explicit operator consent;
+follow [PAIRING.md](PAIRING.md). It grants **broad session API access**, not
+wake-only permissions. Paired mode uses Docket's own binding and rediscovers
+the desktop loopback port. Enrollment latches host selection; missing, expired,
+revoked, unreadable or mismatched binding fails without credential borrowing,
+old-service or unauthenticated fallback.
 
-The own-record guard is **not host-enforced authentication/capability proof**.
-Optional-auth loopback hosts may accept missing/bogus bearers; a guard/request
-race remains. Real revocation remains unproven. Fake-host refusal tests do not
-establish live revocation. Never destroy the last credential just to test it.
+The own-record guard is **not host-enforced authentication or capability proof**.
+Optional-auth loopback hosts may accept missing/bogus bearers, and a guard/request
+race remains. Live revocation is unproven; synthetic refusal tests are not proof.
+Do not destroy the last credential to test revocation.
 
-## API, MCP and state
+### Optional macOS service
 
-API reads are local; mutations require the Docket bearer token. Metadata is
-`GET /api/v1/meta`; item/occurrence listings are under `/api/v1/items` and
-`/api/v1/occurrences`. Default pending listings include firing, admitted and
-ambiguous states. `python3 -m docket mcp` exposes stdio JSON-RPC tools for
-timer/alarm/recurring/watch/list/occurrences/cancel via the running local API;
-it does not register itself in any host config. `DOCKET_URL`/`DOCKET_TOKEN`
-override discovery; protect them as private configuration.
+`python3 -m docket service` supports `install`, `start`, `stop`, `restart`,
+`status` and `uninstall` for a user LaunchAgent. **Install starts the job; never
+run it alongside `serve`.** Installation pins the running Python executable and
+package location, not `bin/docket`. Relocation requires reinstalling.
 
-State under `~/.docket/` (`DOCKET_HOME` override) includes SQLite, token,
-server metadata and logs. Pairing adds private binding/enrollment records.
-Keep this state out of source control. Back up SQLite consistently, including
-WAL semantics, and preserve bindings. Never copy an old DB over a live one:
-it can discard receipts or replay stale work. Recovery requires coordinated,
-stopped-service review. The optional archive overlay is read, never modified;
-unreadable overlay is not interpreted as no archived sessions.
+State defaults to `~/.docket`; `DOCKET_HOME` must resolve to a nonempty absolute
+path. `DOCKET_DELIVERY_HOST` accepts `auto` (default), `opencode`,
+`openchamber-paired` or `openchamber-unpaired`; enrollment still takes precedence.
+The plist persists only PATH, HOME, USER, LOGNAME, resolved DOCKET_HOME and
+DOCKET_DELIVERY_HOST, not the whole environment or credentials. Changes require
+reinstallation; existing state is not migrated. Stopping prevents delivery;
+uninstall does not erase state or history.
 
-Fleet can supervise a deliberately configured daemon; Tarmac can supply quota
-observations to a separate router. Docket itself neither reserves quotas nor
-dispatches arbitrary worker processes or contacts the principal directly.
+## API, MCP and private state
 
-## Optional panel and validation safety stop
+API reads are local; mutations require the Docket bearer token. Metadata is at
+`GET /api/v1/meta`, with listings at `/api/v1/items` and `/api/v1/occurrences`.
+Pending listings include firing, admitted and ambiguous states.
 
-See [openchamber/README.md](openchamber/README.md) for the source-only extension.
-No bundle/icon or extension activation is supplied here.
+`python3 -m docket mcp` exposes stdio JSON-RPC tools for creating, listing and
+cancelling schedules through the running API; it does not register itself in
+host configuration. `DOCKET_URL` and `DOCKET_TOKEN` override discovery; protect
+them as private configuration.
 
-![Real full Docket panel at 9:47 PM, Outstanding 0 and Undeliverable 1, service 0.3.0](assets/screenshots/q88-manual-srgb-docket.png)
+`~/.docket/` holds SQLite, token, server metadata and logs; pairing adds private
+binding/enrollment records. Keep this state out of source control. Back up SQLite
+consistently (including WAL semantics) and preserve bindings. Never copy an old
+database over a live one: it can discard history or replay stale work. Recovery
+requires coordinated, stopped-service review. The optional archive overlay is
+read, never modified; an unreadable overlay is not treated as no archived sessions.
 
-Owner-provided real full panel read at 9:47 PM: **0 outstanding and 1 undeliverable**, not an empty healthy scheduler. The service 0.3.0 warning says the installed service upgrades separately and the panel does not restart it. This is not delivery, pairing, restart or packaged-extension acceptance. The approved sRGB derivative intentionally color-converted the original RGB; it is included byte-for-byte without another conversion.
+## Optional OpenChamber panel
 
-**Do not run full discovery, browser, CDP, e2e or evidence scripts.** The inherited
-browser-suite containment issue is unresolved: a browser updater escaped the
-previous isolation attempt. The prior reviewed full-suite result was 143/145,
-with browser-startup failures, not green; it is not a staging result. Browser
-test sources are retained (with synthetic paths), not removed to hide failures.
-Only separately inspected, selected offline tests in a temporary HOME with
-network/process guards and <=120s watchdog are appropriate for this lane.
-No current-host delivery, pairing, revocation, restart or full-suite acceptance
-is claimed by this package.
+![Docket panel showing zero outstanding items, one undeliverable item and a service 0.3.0 notice](assets/screenshots/q88-manual-srgb-docket.png)
+
+Real owner-provided panel capture: **0 outstanding, 1 undeliverable**, not an
+empty healthy scheduler. The service upgrades separately; the panel does not
+restart it. This is not proof of delivery, pairing, restart or packaged-extension
+acceptance. The prepared sRGB image is reused unchanged.
+
+The [panel source](openchamber/README.md) is included, but no built bundle or
+manifest icon is supplied. **It is not a ready-to-activate extension.**
+
+## Validation and known limits
+
+Do not run full test discovery, browser/CDP, e2e or evidence scripts: a browser
+updater escaped an earlier isolation attempt. Browser test sources remain for
+containment review. The historical full-suite result was 143/145 with browser
+startup failures, not green and not a result of this preparation.
+
+Use only inspected offline tests with a temporary HOME, network/process guards
+and a watchdog of at most 120 seconds. No current-host delivery, pairing,
+revocation, service restart or full-suite acceptance is claimed here.
+
+## License and artwork
+
+Original principal-owned code and documentation are [MIT licensed](LICENSE).
+The existing comic marks are **AI-generated artwork**, also offered under MIT
+to the extent applicable, without a claim of exclusive copyright in AI output.
+The [32px mark](assets/workstack-mark-32.png) is a separate composition, not a
+downscaled badge. See [RIGHTS.md](RIGHTS.md) for asset scope and outside notices.
