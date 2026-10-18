@@ -10,6 +10,24 @@ API and stdio MCP, with SQLite persistence and a Python 3.11+ standard-library
 runtime. An optional OpenChamber panel lists and removes items; it does not
 deliver wakes.
 
+## Why use Docket?
+
+Many agent harnesses already offer recurring automations. Docket lives outside
+the harness: it lets a compatible agent arrange a later wake or check-in during
+ongoing work, not just set up recurring routines.
+
+For example, an agent can ask to be woken in 20 minutes to check a download
+expected to finish then. Or it can start a background job and arrange a later
+check-in, or set a regular reminder. A note in a Markdown file does not wake a
+session, and keeping an agent in a model-powered polling loop is unnecessary.
+
+Docket schedules the wake, or checks a bounded watch condition, and asks the
+host to resume the existing compatible session when due. It does not run the
+download or background job itself, and a check-in does not guarantee that work
+has finished. Watches still perform periodic checks; they do not keep a model
+running. Other harnesses need a compatible delivery adapter, not just Docket
+installed alongside them.
+
 ## Quick start
 
 From a stable checkout with Python 3.11+:
