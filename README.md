@@ -77,10 +77,24 @@ history is retained. Admission-time lateness may differ from final consumption l
 
 ## Host setup
 
-Generic unpaired discovery uses older official OpenCode service metadata and
-its runtime basic credential, restricted to loopback. Host/API compatibility
-must be checked before real scheduling; merely sharing a transcript database
-or delivering to an idle session does not prove ownership of a busy turn.
+Generic unpaired discovery reads the URL from
+`~/.local/state/opencode/service.json`, falling back to `opencode service status`.
+It reads the runtime password from that state file or, as a fallback,
+`~/.config/opencode/service.json`, using Basic auth with username `opencode`.
+The host URL must be loopback; keep these credential files private.
+
+The caller's host must support `POST /api/session/{session_id}/prompt` with a
+caller-supplied stable `msg_` ID, `text`, `delivery: queue` or `steer`, and
+`resume: true`. Retrying an admitted ID must preserve the original admission
+without duplicating it. Reconciliation requires
+`GET /api/session/{session_id}/message/{id}` and
+`GET /api/session/{session_id}/inbox`; cancellation requires
+`DELETE /api/session/{session_id}/inbox/{id}`. The message lookup must identify
+consumption by that ID, distinct from an item still in the inbox.
+
+Check this compatibility on the caller's host before real scheduling; current
+live-host acceptance is unverified. Merely sharing a transcript database or
+delivering to an idle session does not prove ownership of a busy turn.
 
 Optional OpenChamber own-client pairing requires explicit operator consent;
 follow [PAIRING.md](PAIRING.md). It grants **broad session API access**, not
@@ -131,24 +145,22 @@ read, never modified; an unreadable overlay is not treated as no archived sessio
 
 ![Docket panel showing zero outstanding items, one undeliverable item and a service 0.3.0 notice](assets/screenshots/q88-manual-srgb-docket.png)
 
-Real owner-provided panel capture: **0 outstanding, 1 undeliverable**, not an
+Genuine panel screenshot: **0 outstanding, 1 undeliverable**, not an
 empty healthy scheduler. The service upgrades separately; the panel does not
 restart it. This is not proof of delivery, pairing, restart or packaged-extension
-acceptance. The prepared sRGB image is reused unchanged.
+acceptance.
 
 The [panel source](openchamber/README.md) is included, but no built bundle or
 manifest icon is supplied. **It is not a ready-to-activate extension.**
 
-## Validation and known limits
+## Known limitations
 
 Do not run full test discovery, browser/CDP, e2e or evidence scripts: a browser
 updater escaped an earlier isolation attempt. Browser test sources remain for
-containment review. The historical full-suite result was 143/145 with browser
-startup failures, not green and not a result of this preparation.
+containment review.
 
-Use only inspected offline tests with a temporary HOME, network/process guards
-and a watchdog of at most 120 seconds. No current-host delivery, pairing,
-revocation, service restart or full-suite acceptance is claimed here.
+Live host delivery, pairing, revocation and service restart remain unverified;
+no full-suite acceptance is claimed.
 
 ## License and artwork
 
