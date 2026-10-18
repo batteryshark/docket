@@ -1,4 +1,4 @@
-# Optional Docket panel — source-only review
+# Optional Docket panel — source only
 
 The panel lists outstanding items and undeliverable history and can request
 removal. It does not deliver wakes or implement a delivery callback. A consumed
@@ -8,8 +8,8 @@ Manifest: extension 0.1.0, SDK 2.3.2, OpenChamber >=2.3.0. This range is not
 fresh compatibility proof. Requires Node/npm plus separately approved SDK and
 esbuild dependencies. After approval, `npm install` and `npm run build` in this
 folder would produce `panel/main.js`. No dependencies, bundle or icon are
-included here; the manifest's `icon.svg` remains unresolved pending asset
-selection/rights review. **Do not activate this incomplete staging.**
+included here; the manifest's `icon.svg` has not been supplied. The root comic
+marks do not fill that manifest entry. **Do not activate this incomplete extension.**
 
 After build/asset/license/security review, the operator would add this folder
 in Settings → Extensions and consent to its host service. The relay reads the
