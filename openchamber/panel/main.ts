@@ -1,7 +1,17 @@
 import {connectHost, HostRequestError} from '@openchamber/sdk';
 import {applyHostReady, mountBadge, mountBanner, mountButton, mountEmpty, mountSpinner, mountTabs, type Tone} from '@openchamber/sdk/ui';
 
-type Item = {
+type Delivery = {
+  unit_id: string; request_id: string | null; outcome: string; phase: string;
+  facts: Record<string, boolean | null>; execution: 'unknown'; evidence: string | null;
+  stale: boolean; last_checked_at: string | null;
+  issue: Issue | null; check_issue: Issue | null; receipt_issue: Issue | null;
+  recovery: {reconcile: boolean; retry: boolean; refusal_code: string | null};
+  namespace_verified: boolean; same_daemon_recovery: boolean;
+};
+type Issue = {code: string; detail: string};
+type Evidence = {delivery: Delivery | null; unit_scope: 'items' | 'occurrences' | null};
+type Item = Evidence & {
   id: string;
   kind: string;
   status: string;
@@ -15,12 +25,12 @@ type Item = {
   created_by: string | null;
   session_id: string;
   directory: string | null;
-  delivery_state: string | null;
-  open_status: string | null;
-  error: string | null;
+  delivery_summary: Record<string, number> | null;
+  coalesced_slots: number | null;
 };
 
-type Occurrence = {
+type Occurrence = Evidence & {
+  current_unit: boolean;
   id: string;
   item_id: string;
   seq: number;
@@ -28,7 +38,6 @@ type Occurrence = {
   scheduled_at: string;
   late: boolean;
   late_by_seconds: number | null;
-  error: string | null;
   reason?: string;
   created_by?: string | null;
   session_id?: string;
@@ -40,15 +49,23 @@ type Snapshot = {
   generated_at: string;
   version: string | null;
   history_unavailable: boolean;
+  items_history_unavailable: boolean;
+  history_limited: boolean;
+  history_truncated: boolean;
+  outstanding_limited: boolean;
+  outstanding_window_unavailable: boolean;
+  history_parent_unavailable: boolean;
+  fields_truncated: boolean;
   outstanding: Item[];
-  undeliverable_items: Item[];
-  undeliverable_occurrences: Occurrence[];
+  history_items: Item[];
+  history_occurrences: Occurrence[];
 };
 
 type Notice = {tone: 'info' | 'warning' | 'error' | 'success'; title: string; body?: string};
 type View = 'outstanding' | 'undeliverable';
 
 const ITEM_ID = /^dkt_[0-9a-f]{16}$/;
+const OCC_ID = /^occ_[0-9a-f]{16}$/;
 const VISIBLE_POLL_MS = 30_000;
 const HIDDEN_POLL_MS = 120_000;
 const CANCELLABLE = new Set(['pending', 'firing', 'admitted', 'ambiguous']);
@@ -90,25 +107,42 @@ function lateText(late: boolean, seconds: number | null) {
   return rounded === 1 ? 'late by 1s' : `late by ${rounded}s`;
 }
 
-function stateOf(item: Item): {key: string; label: string; tone: Tone} {
-  const delivery = item.delivery_state;
-  const status = item.open_status || item.status;
-  if (delivery === 'consumed' || item.status === 'delivered' || item.status === 'completed') {
-    return {key: 'consumed', label: 'consumed', tone: 'success'};
+function stateOf(item: Evidence): {key: string; label: string; tone: Tone} {
+  const key = item.delivery?.outcome || 'unknown';
+  const tone: Tone = key === 'delivered' ? 'success' : key === 'failed' ? 'error'
+    : key === 'uncertain' ? 'warning' : key === 'admitted' ? 'info' : 'neutral';
+  return {key, label: key === 'unknown' ? 'Delivery unavailable / unknown'
+    : key === 'not_applicable' ? 'No open delivery unit' : `Message: ${key}`, tone};
+}
+
+function evidence(card: HTMLElement, row: Evidence, historical = false) {
+  const d = row.delivery;
+  if (!d) {
+    card.append(el('div', 'meta', 'Delivery evidence and recovery unavailable (old or malformed backend projection).'));
+    return;
   }
-  if (item.status === 'undeliverable' || delivery === 'lost') {
-    return {key: 'undeliverable', label: 'undeliverable', tone: 'error'};
+  card.append(metaLine([
+    d.request_id ? `Request ${d.request_id}` : 'Request identity not available for display',
+    `Evidence ${d.evidence || 'unknown'} · phase ${d.phase || 'unknown'}`,
+    d.last_checked_at ? `Checked ${when(d.last_checked_at)}` : 'Not checked',
+    d.stale ? 'Evidence stale — latest check unavailable' : null,
+    d.same_daemon_recovery ? 'Original live-daemon binding retained' : null,
+  ]));
+  card.append(el('div', 'meta', Object.entries(d.facts).map(([key, value]) => `${key}: ${value === true ? 'yes' : value === false ? 'no' : 'unknown'}`).join(' · ')));
+  for (const issue of [d.issue, d.check_issue, d.receipt_issue]) {
+    if (issue) card.append(el('div', 'error', `${issue.code}: ${issue.detail}`));
   }
-  if (status === 'admitted' || delivery === 'admitted') {
-    return {key: 'admitted', label: 'admitted, not consumed', tone: 'info'};
-  }
-  if (status === 'ambiguous' || delivery === 'ambiguous') {
-    return {key: 'ambiguous', label: 'ambiguous, not retried', tone: 'warning'};
-  }
-  if (status === 'firing' || delivery === 'sending') {
-    return {key: 'firing', label: 'firing', tone: 'warning'};
-  }
-  return {key: 'pending', label: 'pending', tone: 'neutral'};
+  const actions = el('div', 'actions');
+  const pending = busy.has(d.unit_id);
+  const canAddress = row.unit_scope !== null;
+  mountButton(actions, {label: 'Check status', variant: 'outline', size: 'xs', disabled: pending || !canAddress || !d.recovery.reconcile,
+    onClick: () => void recover(row, 'reconcile')});
+  mountButton(actions, {label: 'Safe retry', variant: 'outline', size: 'xs', disabled: pending || historical || !canAddress || !d.recovery.retry,
+    onClick: () => void recover(row, 'retry', historical)});
+  card.append(actions);
+  if (!canAddress) card.append(el('div', 'meta', 'Recovery unavailable: no exact current delivery unit.'));
+  if (!d.recovery.reconcile) card.append(el('div', 'meta', 'Status check unavailable: no saved request identity.'));
+  if (historical || !d.recovery.retry) card.append(el('div', 'meta', `Retry unavailable: ${historical ? 'historical unit (read-only)' : d.recovery.refusal_code || 'core eligibility unavailable'}.`));
 }
 
 function metaLine(parts: Array<string | null | undefined>) {
@@ -129,6 +163,7 @@ function itemCard(item: Item) {
   const title = el('span', 'kind', item.check ? `${item.kind} · ${item.check}` : item.kind);
   top.append(title);
   const flags = el('span', 'actions');
+  mountBadge(flags, {label: `Schedule: ${item.status}`, tone: 'neutral'});
   mountBadge(flags, {label: state.label, tone: state.tone});
   if (item.urgent) mountBadge(flags, {label: 'urgent', tone: 'warning'});
   const late = lateText(item.late, item.late_by_seconds);
@@ -145,7 +180,8 @@ function itemCard(item: Item) {
     item.every_seconds ? `Poll every ${item.every_seconds}s` : null,
     item.id,
   ]));
-  if (item.error) card.append(el('div', 'error', item.error));
+  if (item.delivery_summary) card.append(el('div', 'meta', `Series summary (bounded core counts): ${Object.entries(item.delivery_summary).map(([key, count]) => `${key} ${count}`).join(' · ') || 'no occurrences'} · coalesced slots ${item.coalesced_slots ?? 'unknown'} (not delivered wakes)`));
+  evidence(card, item);
   if (CANCELLABLE.has(item.status)) {
     const actions = el('div', 'actions');
     mountButton(actions, {
@@ -153,6 +189,7 @@ function itemCard(item: Item) {
       variant: 'outline',
       size: 'xs',
       loading: busy.has(item.id),
+      disabled: busy.has(item.id),
       onClick: () => void remove(item.id),
     });
     card.append(actions);
@@ -164,13 +201,13 @@ function historyCard(row: Occurrence | Item, kind: 'occurrence' | 'item') {
   const card = el('section', 'card');
   card.dataset.historyId = kind === 'occurrence' ? (row as Occurrence).id : row.id;
   const top = el('div', 'top');
-  top.append(el('span', 'kind', kind === 'occurrence' ? 'Undeliverable wake' : 'Undeliverable item'));
-  mountBadge(top, {label: 'undeliverable', tone: 'error'});
+  top.append(el('span', 'kind', kind === 'occurrence' ? 'Wake evidence' : 'Item evidence'));
+  mountBadge(top, {label: `Schedule: ${row.status}`, tone: 'neutral'});
+  const state = stateOf(row);
+  mountBadge(top, {label: state.label, tone: state.tone});
   card.append(top);
   const reason = 'reason' in row ? row.reason : '';
   card.append(el('div', 'reason', reason || '(no reason)'));
-  const error = row.error;
-  if (error) card.append(el('div', 'error', error));
   const whenAt = kind === 'occurrence' ? (row as Occurrence).scheduled_at : (row as Item).fire_at;
   const late = lateText(row.late, row.late_by_seconds);
   card.append(metaLine([
@@ -181,14 +218,16 @@ function historyCard(row: Occurrence | Item, kind: 'occurrence' | 'item') {
     late || null,
     kind === 'occurrence' ? `Item ${(row as Occurrence).item_id}` : row.id,
   ]));
+  if (kind === 'item' && (row as Item).delivery_summary) card.append(el('div', 'meta', `Series summary (bounded core counts): ${Object.entries((row as Item).delivery_summary!).map(([key, count]) => `${key} ${count}`).join(' · ')} · coalesced slots ${(row as Item).coalesced_slots ?? 'unknown'} (not delivered wakes)`));
+  evidence(card, row, kind === 'occurrence' ? !(row as Occurrence).current_unit : ['watch', 'recurring'].includes(row.kind || ''));
   return card;
 }
 
 function historyRows() {
   if (!snapshot) return [];
   return [
-    ...snapshot.undeliverable_occurrences.map(row => historyCard(row, 'occurrence')),
-    ...snapshot.undeliverable_items.map(row => historyCard(row, 'item')),
+    ...snapshot.history_occurrences.map(row => historyCard(row, 'occurrence')),
+    ...snapshot.history_items.map(row => historyCard(row, 'item')),
   ];
 }
 
@@ -210,7 +249,7 @@ function paint() {
   mountTabs(node('tabs'), {
     items: [
       {id: 'outstanding', label: 'Outstanding', count: outstanding.length},
-      {id: 'undeliverable', label: 'Undeliverable', count: history.length},
+      {id: 'undeliverable', label: 'Recent evidence', count: history.length},
     ],
     activeId: view,
     onChange: id => {
@@ -218,23 +257,24 @@ function paint() {
       paint();
     },
   });
+  if (snapshot.fields_truncated) list.append(el('div', 'meta', 'Some display metadata was shortened by the compact read view.'));
+  if (view === 'outstanding' && (snapshot.history_unavailable || snapshot.items_history_unavailable)) list.append(el('div', 'error', 'Some optional history is unavailable; outstanding work is still shown.'));
   if (view === 'outstanding') {
     if (!outstanding.length) {
       mountEmpty(list, {title: 'Nothing outstanding', body: 'No pending, firing, admitted, or ambiguous item.'});
     }
     for (const item of outstanding) list.append(itemCard(item));
-  } else if (snapshot.history_unavailable) {
-    mountEmpty(list, {
-      title: 'History needs the upgraded service',
-      body: 'This Docket process does not list undeliverable wakes yet. The running service is upgraded separately.',
-    });
-  } else if (!history.length) {
-    mountEmpty(list, {title: 'No undeliverable wakes', body: 'Failed deliveries stay here after the item leaves the outstanding list.'});
+    if (snapshot.outstanding_limited) list.append(el('div', 'meta', 'Outstanding list truncated by relay bounds.'));
+    if (snapshot.outstanding_window_unavailable) list.append(el('div', 'error', 'Outstanding window completeness is unavailable on this backend.'));
   } else {
+    if (snapshot.history_unavailable || snapshot.items_history_unavailable) list.append(el('div', 'error', 'Some history is unavailable; this is not evidence of no delivery.'));
+    if (snapshot.history_parent_unavailable) list.append(el('div', 'error', 'Some history parent details are unavailable.'));
+    list.append(el('div', 'meta', `Bounded recent evidence by last update, not a complete audit. Core and panel: at most 40 terminal items and 40 occurrences.${snapshot.history_truncated ? ' Results truncated.' : ''}`));
+    if (!history.length) mountEmpty(list, {title: 'No evidence available in this window', body: 'Absence is not proof that a message was not sent.'});
     for (const row of history) list.append(row);
   }
   const version = snapshot.version ? `Service ${snapshot.version}. ` : '';
-  node('footer').textContent = version + 'The installed Docket service is upgraded separately. This panel does not restart it.';
+  node('footer').textContent = version + 'Delivered means matching transcript consumption, not successful agent execution (unknown). Coalesced slots are not delivered wakes. The panel does not restart the service.';
 }
 
 function say(next: Notice | null) {
@@ -246,11 +286,11 @@ function say(next: Notice | null) {
 
 function explain(error: unknown): Notice {
   if (error instanceof HostRequestError) {
-    if (error.code === 'NO_SERVICE') return {tone: 'warning', title: 'Allow the Docket service', body: 'Approve it in Settings → Extensions. It only relays list and remove to Docket on loopback.'};
+    if (error.code === 'NO_SERVICE') return {tone: 'warning', title: 'Allow the Docket service', body: 'Approve it in Settings → Extensions. It relays lists, stop, status checks and core-authorized recovery to Docket on loopback.'};
     if (error.code === 'DISABLED') return {tone: 'info', title: 'Docket is paused', body: 'Resume it in Settings → Extensions.'};
     if (error.code === 'SERVICE_FAILED') return {tone: 'error', title: 'The Docket relay stopped', body: 'Close and reopen this panel to restart it.'};
   }
-  return {tone: 'error', title: 'Docket is unreachable', body: error instanceof Error ? error.message : String(error)};
+  return {tone: 'error', title: 'Docket is unreachable', body: 'Operation unavailable or timed out. No automatic resend; refresh or check status.'};
 }
 
 async function call(method: 'GET' | 'POST', path: string) {
@@ -286,6 +326,7 @@ async function load() {
 }
 
 async function remove(id: string) {
+  if (busy.has(id)) return;
   if (!ITEM_ID.test(id)) {
     say({tone: 'error', title: 'Not removed', body: 'That is not a Docket id.'});
     return;
@@ -294,23 +335,56 @@ async function remove(id: string) {
   paint();
   try {
     const {status, value} = await call('POST', `/items/${id}/remove`);
-    const detail = typeof value.detail === 'string' ? value.detail : 'Docket did not remove it.';
-    if (status === 200 && value.removed === true && value.outcome === 'removed'
-      && (value.retraction === 'retracted' || value.retraction === 'none')) {
-      say({tone: 'success', title: 'Removed', body: detail});
+    const stopped = value.schedule_stopped === true;
+    const retraction = value.retraction;
+    const coreError = value.error as Issue | null;
+    const details = retraction === 'not_sent' ? 'Core confirms this wake was not sent.'
+      : retraction === 'retracted' ? 'Core confirms retraction.'
+      : retraction === 'too_late' ? 'Already consumed; stopping the schedule does not undo delivery or establish execution.'
+      : 'Prior delivery is uncertain; an in-flight or late wake may still arrive. Check status.';
+    say({tone: status === 200 && stopped && ['not_sent', 'retracted'].includes(String(retraction)) ? 'success' : 'warning',
+      title: status === 200 && stopped ? 'Schedule stopped' : 'Stop not confirmed',
+      body: `${stopped ? 'Schedule is stopped. ' : ''}${details}${coreError ? ` ${coreError.code}: ${coreError.detail}` : ''}`});
+    const returned = value.item as Item | null;
+    if (returned?.id === id && snapshot) {
+      snapshot.outstanding = snapshot.outstanding.map(item => item.id === id ? returned : item);
     }
-    else say({
-      tone: ['consumed', 'missing', 'lost'].includes(String(value.outcome)) ? 'warning' : 'error',
-      title: value.outcome === 'consumed' ? 'Already delivered'
-        : status === 200 && ['missing', 'lost'].includes(String(value.outcome)) ? 'Item stopped'
-        : 'Could not confirm removal',
-      body: detail,
-    });
   } catch (error) {
     say({...explain(error), title: 'Could not confirm removal'});
   }
   busy.delete(id);
   await load();
+}
+
+async function recover(row: Evidence, operation: 'reconcile' | 'retry', historical = false) {
+  const d = row.delivery;
+  const scope = row.unit_scope;
+  if (!d || !scope || !(scope === 'items' ? ITEM_ID : OCC_ID).test(d.unit_id)
+    || busy.has(d.unit_id) || !d.recovery[operation] || (operation === 'retry' && historical)) return;
+  busy.add(d.unit_id);
+  paint();
+  try {
+    const {status, value} = await call('POST', `/${scope}/${encodeURIComponent(d.unit_id)}/${operation}`);
+    const current = value.occurrence || value.item;
+    const result = current as {delivery?: Delivery} | null;
+    const error = value.error as Issue | null;
+    if (operation === 'retry' && status === 202 && value.authorized === true) {
+      say({tone: 'info', title: 'Retry authorized — not delivered', body: 'Core authorized one same-unit attempt. The scheduler performs it later; no new identity or automatic client resend.'});
+    } else if (operation === 'reconcile' && status === 200 && result?.delivery) {
+      say({tone: 'info', title: 'Status checked', body: `Core outcome: ${result.delivery.outcome}. Execution remains unknown.`});
+    } else {
+      say({tone: 'warning', title: `Operation refused or unavailable (${status})`,
+        body: error ? `${error.code}: ${error.detail}${result?.delivery ? ` · Core outcome: ${result.delivery.outcome}` : ''}` : 'No confirmed operation result. No automatic resend.'});
+    }
+    // Retain returned evidence even when the following refresh is unavailable.
+    const returned = result?.delivery;
+    if (returned?.unit_id === d.unit_id) row.delivery = returned;
+  } catch {
+    say({tone: 'warning', title: 'Operation result unknown', body: 'Timed out or unavailable. No automatic resend; use a status check before further action.'});
+  } finally {
+    busy.delete(d.unit_id);
+    await load();
+  }
 }
 
 function schedule() {

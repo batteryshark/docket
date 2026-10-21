@@ -11,6 +11,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from docket.parse import DURATION_RE, local_zone, parse_delay, validate_session_id
+from docket.platform import fully_qualified_path
 
 MIN_RECURRING_INTERVAL = 60
 MAX_RECURRING_INTERVAL = 90 * 24 * 3600
@@ -70,7 +71,7 @@ FORBIDDEN_FIELDS = (
     "phone",
 )
 
-ACTIVE = ("pending", "firing")
+ACTIVE = ("pending", "firing", "admitted", "ambiguous")
 
 
 class LimitError(ValueError):
@@ -262,7 +263,7 @@ def watch_spec(body: dict, *, now: datetime, capture_process) -> tuple[datetime,
 
 
 def check_limits(active, *, kind: str, session_id: str, created_by: str | None) -> None:
-    rows = [item for item in active if item.status in ACTIVE]
+    rows = [item for item in active if item.status in ACTIVE or getattr(item, "capacity_reserved", False)]
     if len(rows) >= MAX_PENDING_GLOBAL:
         raise LimitError(f"docket already has {MAX_PENDING_GLOBAL} pending items")
     target_rows = [item for item in rows if (item.target or {}).get("session_id") == session_id]
@@ -469,7 +470,7 @@ def _absolute_path(value) -> str:
         raise ValueError("path is invalid")
     if len(path) > MAX_PATH:
         raise ValueError("path is too long")
-    if not path.startswith("/"):
+    if not fully_qualified_path(path):
         raise ValueError("path must be absolute")
     return path
 

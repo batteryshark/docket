@@ -10,8 +10,10 @@ Opening an older database only adds missing tables. Item rows are not rewritten.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -19,6 +21,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from docket.bounds import ANONYMOUS_ACTOR, actor_bucket
+from docket.delivery_state import decode_receipt, receipt_projection
+from docket.platform import (
+    create_private_file,
+    prepare_private_db,
+    private_directory,
+    read_private_bytes,
+    state_root,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -67,6 +77,36 @@ CREATE TABLE IF NOT EXISTS occurrences (
 );
 CREATE INDEX IF NOT EXISTS idx_occ_item ON occurrences(item_id, seq);
 CREATE INDEX IF NOT EXISTS idx_occ_status ON occurrences(status, updated_at);
+CREATE TABLE IF NOT EXISTS delivery_meta (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  writer_format INTEGER NOT NULL,
+  caller TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS delivery_requests (
+  unit_id TEXT PRIMARY KEY,
+  item_id TEXT NOT NULL,
+  occurrence_id TEXT UNIQUE,
+  caller TEXT NOT NULL,
+  request_id TEXT UNIQUE,
+  provenance TEXT NOT NULL,
+  frozen_json TEXT,
+  digest TEXT,
+  send_started_at TEXT,
+  dispatch_state TEXT NOT NULL DEFAULT 'never',
+  facts_json TEXT NOT NULL DEFAULT '{}',
+  issue_json TEXT,
+  check_issue_json TEXT,
+  checked_at TEXT,
+  phase TEXT NOT NULL DEFAULT 'prepared',
+  stop_requested INTEGER NOT NULL DEFAULT 0,
+  manual_used INTEGER NOT NULL DEFAULT 0,
+  manual_pending INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 0,
+  CHECK ((occurrence_id IS NULL AND unit_id=item_id)
+         OR (occurrence_id IS NOT NULL AND occurrence_id=unit_id))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_one_shot
+  ON delivery_requests(item_id) WHERE occurrence_id IS NULL;
 """
 
 # Not terminal. The default pending view includes every one of these.
@@ -75,7 +115,7 @@ CANCELLABLE = OUTSTANDING
 
 
 def home() -> Path:
-    root = Path(os.environ.get("DOCKET_HOME", "~/.docket")).expanduser()
+    root = state_root()
     _private_dir(root)
     return root
 
@@ -86,12 +126,14 @@ def token_path() -> Path:
 
 def load_token() -> str:
     path = token_path()
-    if path.exists():
-        return path.read_text().strip()
+    # Exclusive creation prevents a world-readable creation window. Existing
+    # tokens are verified by handle, never followed through a symlink.
     value = secrets.token_urlsafe(32)
-    path.write_text(value + "\n")
-    path.chmod(0o600)
-    return value
+    try:
+        create_private_file(path, (value + "\n").encode("utf-8"))
+        return value
+    except FileExistsError:
+        return read_private_bytes(path, max_bytes=4096).decode("utf-8").strip()
 
 
 def server_path() -> Path:
@@ -121,6 +163,8 @@ class Item:
     next_attempt_at: datetime | None
     firing_at: datetime | None
     spec: dict | None
+    capacity_reserved: bool = False
+    receipt_malformed: bool = False
 
     def public(self) -> dict:
         return {
@@ -169,6 +213,7 @@ class Occurrence:
     firing_at: datetime | None
     coalesced: int
     detail: dict | None
+    receipt_malformed: bool = False
 
     def public(self) -> dict:
         return {
@@ -194,18 +239,214 @@ class Occurrence:
 class Store:
     def __init__(self, path: Path):
         self.path = path
-        _private_dir(self.path.parent)
+        # Refuse symlinks/hardlinks/unprivate files before sqlite can read or mutate the file.
+        prepare_private_db(path)
         self._lock = threading.RLock()
+        # Ownership is deliberately not durable: a matching port is not a server identity.
+        self._binding_owners: set[str] = set()
+        self._caller_identity: str | None = None
         self._db = sqlite3.connect(str(path), check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=5000")
-        self._db.executescript(SCHEMA)
-        self._commit()
+        try:
+            self._db.row_factory = sqlite3.Row
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA busy_timeout=5000")
+            had_delivery_meta = self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_meta'"
+            ).fetchone() is not None
+            self._db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
+            meta = self._db.execute("SELECT * FROM delivery_meta WHERE singleton=1").fetchone()
+            if not meta:
+                if had_delivery_meta or self._db.execute("SELECT 1 FROM delivery_requests LIMIT 1").fetchone():
+                    raise ValueError("delivery caller metadata missing; refusing caller rotation")
+                self._db.execute("INSERT INTO delivery_meta VALUES (1,1,?)", ("docket-" + secrets.token_hex(16),))
+            caller = self._delivery_caller()
+            self._caller_identity = caller
+            if self._db.execute(
+                "SELECT 1 FROM delivery_requests WHERE caller<>? LIMIT 1", (caller,)
+            ).fetchone():
+                raise ValueError("delivery caller metadata does not match existing requests")
+            self._commit()
+        except BaseException:
+            self._db.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+    def _delivery_caller(self) -> str:
+        """Caller creation is startup-only; missing/malformed identity is never repaired."""
+        meta = self._db.execute("SELECT * FROM delivery_meta WHERE singleton=1").fetchone()
+        if not meta:
+            raise ValueError("delivery caller metadata missing; refusing caller rotation")
+        if meta["writer_format"] != 1:
+            raise ValueError("unsupported delivery writer format")
+        if not isinstance(meta["caller"], str) or re.fullmatch(r"docket-[0-9a-f]{32}", meta["caller"]) is None:
+            raise ValueError("malformed delivery caller metadata; refusing caller rotation")
+        if self._caller_identity is not None and meta["caller"] != self._caller_identity:
+            raise ValueError("delivery caller metadata changed during this process; refusing caller rotation")
+        return meta["caller"]
+
+    def _check_request_caller(self, request) -> str:
+        caller = self._delivery_caller()
+        if request and request["caller"] != caller:
+            raise ValueError("delivery caller metadata does not match existing requests")
+        return caller
+
+    def get_request(self, unit_id: str) -> dict | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM delivery_requests WHERE unit_id=?", (unit_id,)).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["binding_owned"] = unit_id in self._binding_owners
+            for key, column in (("frozen", "frozen_json"), ("facts", "facts_json"),
+                                ("issue", "issue_json"), ("check_issue", "check_issue_json")):
+                result[key] = json.loads(result.pop(column)) if row[column] else None
+            return result
+
+    def reserve_request(self, item: Item, occ: Occurrence | None = None) -> dict:
+        """Reserve once. An attempted legacy row never acquires a replacement id/body."""
+        unit = occ or item
+        with self._lock:
+            existing = self.get_request(unit.id)
+            caller = self._check_request_caller(existing)
+            if existing:
+                return existing
+            table = "occurrences" if occ else "items"
+            row = self._db.execute(f"SELECT * FROM {table} WHERE id=?", (unit.id,)).fetchone()
+            if row is None:
+                raise ValueError("missing delivery unit")
+            receipt, _malformed = decode_receipt(row["receipt_json"])
+            receipt = receipt if isinstance(receipt, dict) else {}
+            pristine = (row["status"] == "pending" and row["attempts"] == 0
+                        and row["receipt_json"] is None and row["firing_at"] is None
+                        and row["delivered_at"] is None)
+            aid = "msg_" + secrets.token_hex(16) if pristine else (receipt.get("admission_id") or receipt.get("inbox_id"))
+            if not isinstance(aid, str):
+                aid = None  # No usable identity; retain the original receipt and never mint a replacement.
+            facts = {}
+            if receipt.get("state") in ("admitted", "consumed"):
+                facts["admitted"] = True
+            if receipt.get("state") == "consumed" or row["status"] == "delivered":
+                facts["consumed"] = True
+            self._db.execute(
+                """INSERT INTO delivery_requests
+                   (unit_id,item_id,occurrence_id,caller,request_id,provenance,dispatch_state,facts_json,stop_requested)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (unit.id, item.id, occ.id if occ else None, caller, aid,
+                 "reserved" if pristine else "legacy", "never" if pristine else "possible",
+                 json.dumps(facts), int(item.status == "cancelled")),
+            )
+            self._commit()
+            return self.get_request(unit.id)
+
+    def freeze_request(self, unit_id: str, frozen: dict) -> dict:
+        """Only this method writes immutable fields, exactly once, before sending."""
+        raw = json.dumps(frozen, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        with self._lock:
+            found = self.get_request(unit_id)
+            self._check_request_caller(found)
+            if not found or found["provenance"] == "legacy":
+                raise ValueError("legacy envelope cannot be reconstructed")
+            if found["frozen"] is not None:
+                if found["digest"] != hashlib.sha256(raw.encode()).hexdigest():
+                    raise ValueError("immutable request conflict")
+                return found
+            self._db.execute(
+                """UPDATE delivery_requests SET frozen_json=?,digest=?,provenance='frozen',revision=revision+1
+                   WHERE unit_id=? AND frozen_json IS NULL AND stop_requested=0""",
+                (raw, hashlib.sha256(raw.encode()).hexdigest(), unit_id),
+            )
+            self._commit()
+            if self.get_request(unit_id)["frozen"] is not None:
+                self._binding_owners.add(unit_id)
+            return self.get_request(unit_id)
+
+    def begin_send(self, unit_id: str, now: datetime) -> bool:
+        """Commit uncertainty before I/O; caller also holds its in-process unit gate."""
+        with self._lock:
+            req = self.get_request(unit_id)
+            self._check_request_caller(req)
+            if not req or not req["frozen"] or req["dispatch_state"] == "possible" or req["stop_requested"]:
+                return False
+            parent = self.get(req["item_id"])
+            unit = self.get_occurrence(req["occurrence_id"]) if req["occurrence_id"] else parent
+            if (not parent or parent.status not in ("pending", "firing") or not unit
+                    or unit.status != "firing" or any(req["facts"].values())):
+                return False
+            if req["occurrence_id"] and (parent.spec or {}).get("open_occurrence_id") != unit.id:
+                return False
+            self._db.execute(
+                """UPDATE delivery_requests SET send_started_at=?,dispatch_state='possible',phase='sending',
+                   manual_pending=0,revision=revision+1 WHERE unit_id=?""", (_iso(now), unit_id),
+            )
+            self._commit()
+            return True
+
+    def note_request(self, unit_id: str, *, facts=None, diagnostic=None,
+                     phase=None, checked_at=None, check_issue=None) -> None:
+        """Merge positive evidence, never overwrite identity or erase a positive fact."""
+        with self._lock:
+            req = self.get_request(unit_id)
+            if not req:
+                return
+            merged = dict(req["facts"])
+            merged.update({key: True for key, value in (facts or {}).items()
+                           if value is True and key in ("admitted", "claimed", "injected", "observed", "consumed", "cancelled", "historicalUncertainty", "failed_before_claim")})
+            self._db.execute(
+                """UPDATE delivery_requests SET facts_json=?,issue_json=?,dispatch_state=?,phase=?,
+                   checked_at=?,check_issue_json=?,revision=revision+1 WHERE unit_id=?""",
+                (json.dumps(merged), json.dumps(diagnostic) if diagnostic else None,
+                 req["dispatch_state"], phase or req["phase"],
+                 _iso(checked_at) if checked_at else req["checked_at"],
+                 json.dumps(check_issue) if check_issue else None, unit_id),
+            )
+            self._commit()
+
+    def authorize_retry(self, unit_id: str, now: datetime) -> str | None:
+        from docket.delivery_state import retry_refusal
+        with self._lock:
+            req = self.get_request(unit_id)
+            refusal = retry_refusal(req)
+            if refusal:
+                return refusal
+            parent = self.get(req["item_id"])
+            occ = self.get_occurrence(req["occurrence_id"]) if req["occurrence_id"] else None
+            if not parent or parent.status == "cancelled":
+                return "cancelled_identity"
+            if occ and (parent.spec or {}).get("open_occurrence_id") != occ.id:
+                return "schedule_advanced"
+            if parent.kind in ("recurring", "watch") and parent.status not in ("pending", "firing"):
+                return "schedule_finished"
+            unit = occ or parent
+            if unit.status not in ("pending", "ambiguous", "undeliverable"):
+                return "not_ready"
+            if req["manual_pending"]:
+                return None
+            self._db.execute(
+                "UPDATE delivery_requests SET manual_used=1,manual_pending=1,revision=revision+1 WHERE unit_id=?",
+                (unit_id,),
+            )
+            table = "occurrences" if occ else "items"
+            self._db.execute(f"UPDATE {table} SET status='pending',next_attempt_at=?,updated_at=? WHERE id=?",
+                             (_iso(now), _iso(now), unit.id))
+            if occ:
+                self._db.execute("UPDATE items SET next_attempt_at=?,updated_at=? WHERE id=?",
+                                 (_iso(now), _iso(now), parent.id))
+            self._commit()
+            return None
+
+    def invalidate_binding(self, unit_id: str) -> None:
+        with self._lock:
+            self._binding_owners.discard(unit_id)
+
+    def stopped_unresolved_requests(self) -> list[dict]:
+        with self._lock:
+            ids = [row[0] for row in self._db.execute(
+                "SELECT unit_id FROM delivery_requests WHERE stop_requested=1 AND dispatch_state='possible'"
+            ).fetchall()]
+            return [req for ident in ids if not (req := self.get_request(ident))["facts"].get("consumed")]
 
     def insert(self, item: Item) -> None:
         with self._lock:
@@ -239,12 +480,42 @@ class Store:
 
     def active_items(self) -> list[Item]:
         with self._lock:
+            reserved = {row["item_id"] for row in self._db.execute(
+                "SELECT item_id,facts_json FROM delivery_requests WHERE dispatch_state='possible'"
+            ).fetchall() if not any(json.loads(row["facts_json"]).get(key) for key in ("consumed", "cancelled"))}
             rows = self._db.execute(
                 """SELECT * FROM items
-                   WHERE status IN ('pending', 'firing')
                    ORDER BY fire_at, id"""
             ).fetchall()
-            return [_item(row) for row in rows]
+            found = []
+            for row in rows:
+                item = _item(row)
+                item.capacity_reserved = item.id in reserved
+                if item.status in OUTSTANDING or item.capacity_reserved:
+                    found.append(item)
+            return found
+
+    def panel_items(self, status: str) -> tuple[list[Item], bool]:
+        """Fixed read windows; the extra row detects truncation without a count scan."""
+        if status not in ("outstanding", "terminal"):
+            raise ValueError("unsupported panel status")
+        limit = 200 if status == "outstanding" else 40
+        predicate = "IN" if status == "outstanding" else "NOT IN"
+        order = "fire_at, id" if status == "outstanding" else "updated_at DESC, id DESC"
+        with self._lock:
+            marks = ",".join("?" * len(OUTSTANDING))
+            rows = self._db.execute(
+                f"SELECT * FROM items WHERE status {predicate} ({marks}) ORDER BY {order} LIMIT ?",
+                (*OUTSTANDING, limit + 1),
+            ).fetchall()
+            return [_item(row) for row in rows[:limit]], len(rows) > limit
+
+    def panel_occurrences(self) -> tuple[list[Occurrence], bool]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM occurrences ORDER BY updated_at DESC, id DESC LIMIT 41"
+            ).fetchall()
+            return [_occurrence(row) for row in rows[:40]], len(rows) > 40
 
     def due_ids(self, now: datetime) -> list[str]:
         with self._lock:
@@ -257,14 +528,32 @@ class Store:
             ).fetchall()
             return [row["id"] for row in rows]
 
-    def claim(self, item_id: str, now: datetime) -> bool:
+    def claim(self, item_id: str, now: datetime, *, max_attempts: int | None = None) -> bool:
+        return self._claim_delivery("items", item_id, now, max_attempts)
+
+    def _claim_delivery(self, table: str, unit_id: str, now: datetime, max_attempts: int | None) -> bool:
+        """Claim + counter increment + manual authorization consumption commit together."""
         with self._lock:
+            unit = self.get_occurrence(unit_id) if table == "occurrences" else self.get(unit_id)
+            req = self.get_request(unit_id)
+            parent = self.get(unit.item_id) if table == "occurrences" and unit else unit
+            if not unit or unit.status != "pending" or not parent or parent.status == "cancelled":
+                return False
+            manual = bool(req and req["manual_pending"])
+            if req and req["stop_requested"]:
+                return False
+            if max_attempts is not None and unit.attempts >= max_attempts and not manual:
+                return False
             cur = self._db.execute(
-                """UPDATE items
-                   SET status='firing', firing_at=?, updated_at=?, attempts=attempts+1
-                   WHERE id=? AND status='pending'""",
-                (_iso(now), _iso(now), item_id),
+                f"""UPDATE {table}
+                    SET status='firing', firing_at=?, updated_at=?, attempts=attempts+1
+                    WHERE id=? AND status='pending'""",
+                (_iso(now), _iso(now), unit_id),
             )
+            if cur.rowcount and manual:
+                self._db.execute(
+                    "UPDATE delivery_requests SET manual_pending=0,revision=revision+1 WHERE unit_id=?", (unit_id,),
+                )
             self._commit()
             return cur.rowcount == 1
 
@@ -319,7 +608,8 @@ class Store:
             return cur.rowcount == 1
 
     def open_summaries(self) -> dict[str, dict]:
-        """Outstanding occurrence pointed at by each item, for the pending view."""
+        """Sanitized outstanding occurrences, including inconsistent/missing pointers."""
+        from docket.delivery_state import issue
         with self._lock:
             rows = self._db.execute(
                 """SELECT id, item_id, status, receipt_json, error
@@ -328,13 +618,16 @@ class Store:
             ).fetchall()
             found: dict[str, dict] = {}
             for row in rows:
-                receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else None
+                raw, malformed = decode_receipt(row["receipt_json"])
+                receipt = receipt_projection(raw, malformed=malformed)
+                code = row["error"].partition(":")[0] if isinstance(row["error"], str) else "unavailable"
                 found[row["item_id"]] = {
                     "id": row["id"],
                     "status": row["status"],
-                    "error": row["error"],
-                    "delivery_state": (receipt or {}).get("state"),
-                    "admission_id": (receipt or {}).get("admission_id"),
+                    "error": issue(code)["detail"] if row["error"] else None,
+                    "delivery_state": receipt["state"],
+                    "admission_id": receipt["admission_id"],
+                    "receipt_issue": receipt["issue"],
                 }
             return found
 
@@ -384,6 +677,10 @@ class Store:
                     WHERE item_id=? AND status IN ({marks})""",
                 (_iso(now), item_id, *CANCELLABLE),
             )
+            self._db.execute(
+                "UPDATE delivery_requests SET stop_requested=1,manual_pending=0,revision=revision+1 WHERE item_id=?",
+                (item_id,),
+            )
             self._commit()
             return "cancelled"
 
@@ -427,7 +724,7 @@ class Store:
         ).fetchone()
         if row is None:
             return
-        receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else {}
+        receipt, _malformed = decode_receipt(row["receipt_json"])
         if not isinstance(receipt, dict):
             receipt = {}
         if admission_id:
@@ -499,16 +796,8 @@ class Store:
             self._update_occurrence(occ)
             self._commit()
 
-    def claim_occurrence(self, occ_id: str, now: datetime) -> bool:
-        with self._lock:
-            cur = self._db.execute(
-                """UPDATE occurrences
-                   SET status='firing', firing_at=?, updated_at=?, attempts=attempts+1
-                   WHERE id=? AND status='pending'""",
-                (_iso(now), _iso(now), occ_id),
-            )
-            self._commit()
-            return cur.rowcount == 1
+    def claim_occurrence(self, occ_id: str, now: datetime, *, max_attempts: int | None = None) -> bool:
+        return self._claim_delivery("occurrences", occ_id, now, max_attempts)
 
     def reclaim_occurrence_ids(self, now: datetime, *, lease_seconds: float) -> list[str]:
         with self._lock:
@@ -594,8 +883,16 @@ class Store:
         )
 
     def _commit(self) -> None:
-        self._db.commit()
-        _seal_db(self.path)
+        try:
+            # Ancillary protection must not turn durable success into an error.
+            # SQLite can create sidecars later inside commit: verified private
+            # inheritance and startup recovery cover those, not a post-commit seal.
+            _seal_db(self.path)
+            self._db.commit()
+        except BaseException:
+            # Do not leave a failed mutation pending for a later call to commit.
+            self._db.rollback()
+            raise
 
     def _insert_occurrence(self, occ: Occurrence) -> None:
         self._db.execute(
@@ -664,6 +961,7 @@ def _row(item: Item) -> tuple:
 
 
 def _item(row: sqlite3.Row) -> Item:
+    receipt, malformed = decode_receipt(row["receipt_json"])
     return Item(
         id=row["id"],
         kind=row["kind"],
@@ -681,7 +979,8 @@ def _item(row: sqlite3.Row) -> Item:
         delivered_at=_parse(row["delivered_at"]),
         cancelled_at=_parse(row["cancelled_at"]),
         error=row["error"],
-        receipt=json.loads(row["receipt_json"]) if row["receipt_json"] else None,
+        receipt=receipt,
+        receipt_malformed=malformed,
         attempts=row["attempts"],
         next_attempt_at=_parse(row["next_attempt_at"]),
         firing_at=_parse(row["firing_at"]),
@@ -705,6 +1004,7 @@ def _occ_row(occ: Occurrence) -> tuple:
 
 
 def _occurrence(row: sqlite3.Row) -> Occurrence:
+    receipt, malformed = decode_receipt(row["receipt_json"])
     return Occurrence(
         id=row["id"],
         item_id=row["item_id"],
@@ -717,7 +1017,8 @@ def _occurrence(row: sqlite3.Row) -> Occurrence:
         late_by_seconds=row["late_by_seconds"],
         delivered_at=_parse(row["delivered_at"]),
         error=row["error"],
-        receipt=json.loads(row["receipt_json"]) if row["receipt_json"] else None,
+        receipt=receipt,
+        receipt_malformed=malformed,
         attempts=row["attempts"],
         next_attempt_at=_parse(row["next_attempt_at"]),
         firing_at=_parse(row["firing_at"]),
@@ -759,22 +1060,10 @@ def _occ_update_values(occ: Occurrence) -> tuple:
     )
 
 
-def _chmod(path: Path, mode: int) -> None:
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        return
-
-
 def _private_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    _chmod(path, 0o700)
+    private_directory(path)
 
 
 def _seal_db(path: Path) -> None:
     """Owner-only database, WAL, and SHM. The directory is already private."""
-    _chmod(path.parent, 0o700)
-    for suffix in ("", "-wal", "-shm"):
-        candidate = Path(str(path) + suffix) if suffix else path
-        if candidate.exists():
-            _chmod(candidate, 0o600)
+    prepare_private_db(path, seal_sidecars=True)

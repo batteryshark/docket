@@ -10,6 +10,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from docket.delivery import DeliveryError, Receipt, Validation
 
 
+def block_source_service_processes():
+    """Module-scoped fail-closed guard; local process mocks may override it."""
+    import contextlib
+    import os
+    import subprocess
+    from unittest.mock import patch
+
+    stack = contextlib.ExitStack()
+
+    def refused(*_args, **_kwargs):
+        raise AssertionError("source service tests forbid native process launch")
+
+    stack.enter_context(patch.object(subprocess, "Popen", side_effect=refused))
+    for name in ("system", "posix_spawn", "posix_spawnp", "fork", "forkpty",
+                 "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+                 "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe"):
+        if hasattr(os, name):
+            stack.enter_context(patch.object(os, name, side_effect=refused))
+    return stack
+
+
+
 class FakeAdapter:
     name = "fake"
 

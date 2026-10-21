@@ -10,7 +10,9 @@ ended.
 from __future__ import annotations
 
 import http.client
+import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -20,6 +22,7 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit
 
 from docket.delivery import DeliveryError
+from docket.platform import child_options, fully_qualified_path, is_windows, windows_process_start
 
 
 STAT_TIMEOUT = 2.0
@@ -171,6 +174,8 @@ class Checks:
             raise RuntimeError("process identity could not be read") from exc
         if not start:
             raise ValueError("process is not running")
+        if _canonical_process_start(start, pid=pid) is None:
+            raise RuntimeError("process identity could not be read")
         return start
 
     def evaluate(self, spec: dict, now: datetime) -> Outcome:
@@ -253,6 +258,8 @@ class Checks:
     def _process_ended(self, spec: dict) -> Outcome:
         pid = int(spec["pid"])
         expected = str(spec.get("process_start") or "")
+        if not _norm(expected):
+            return Outcome("unavailable", "process start identity is missing")
         try:
             current = self.process_reader(pid)
         except (TimeoutError, subprocess.TimeoutExpired):
@@ -261,7 +268,11 @@ class Checks:
             return Outcome("unavailable", "process check unavailable")
         if current is None:
             return Outcome("met", summary={"pid": pid, "ended": "exited", "start": expected})
-        if _norm(current) != _norm(expected):
+        expected_key = _canonical_process_start(expected, pid=pid)
+        current_key = _canonical_process_start(current, pid=pid)
+        if expected_key is None or current_key is None or expected_key[0] != current_key[0]:
+            return Outcome("unavailable", "process identity cannot be compared")
+        if current_key != expected_key:
             return Outcome("met", summary={
                 "pid": pid,
                 "ended": "pid_reused",
@@ -304,20 +315,23 @@ class Checks:
 
 def stat_file(path: str, *, timeout: float = STAT_TIMEOUT) -> FileView:
     """Stat one path in a child so a stuck mount cannot hang the service."""
-    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+    if not fully_qualified_path(path):
         return FileView("unavailable", detail="path is invalid")
     try:
         done = subprocess.run(
-            [sys.executable, "-c", _STAT_CODE, path],
+            [sys.executable, "-I", "-B", "-c", _STAT_CODE, path],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            **child_options(),
         )
     except subprocess.TimeoutExpired:
         return FileView("unavailable", detail="file check timed out")
     except OSError as exc:
         return FileView("unavailable", detail=_short(exc) or "file check unavailable")
+    if done.returncode != 0:
+        return FileView("unavailable", detail="file check failed")
     line = (done.stdout or "").strip().split()
     if not line:
         return FileView("unavailable", detail="file check returned nothing")
@@ -337,36 +351,72 @@ def stat_file(path: str, *, timeout: float = STAT_TIMEOUT) -> FileView:
         return FileView("unavailable", detail="file check returned an unexpected result")
 
 
+_POSIX_START_RE = re.compile(
+    r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})"
+)
+_WINDOWS_START_RE = re.compile(r"win:([1-9]\d*):([1-9]\d*)")
+
+
+def _canonical_process_start(value: str, *, pid: int | None = None) -> tuple[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    normalized = _norm(value)
+    match = _POSIX_START_RE.fullmatch(normalized)
+    if match is not None:
+        weekday, month, day_text, hour_text, minute_text, second_text, year = match.groups()
+        day = int(day_text)
+        if not (1 <= day <= 31 and int(hour_text) <= 23 and int(minute_text) <= 59 and int(second_text) <= 60):
+            return None
+        return ("posix", f"{weekday} {month} {day} {hour_text}:{minute_text}:{second_text} {year}")
+    match = _WINDOWS_START_RE.fullmatch(normalized)
+    if match is not None:
+        if pid is not None and int(match.group(1)) != pid:
+            return None
+        return ("windows", normalized)
+    return None
+
+
 def read_process_start(pid: int, *, timeout: float = PS_TIMEOUT) -> str | None:
     """Return the process start stamp, or None if that pid is not running.
 
-    The stamp is whatever ``ps`` prints for ``lstart``. It is compared with a
-    later read from the same command, so a reused pid does not look like the
-    process that was watched.
+    POSIX uses ps lstart; Windows uses native creation FILETIME. A failure to
+    establish identity raises: only definite absence is returned as None.
     """
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1 or pid > 2**31 - 1:
         raise ValueError("pid must be an integer greater than 1")
+    if is_windows():
+        return windows_process_start(pid)
     try:
         done = subprocess.run(
             ["ps", "-p", str(pid), "-o", "pid=,lstart="],
+            env={**os.environ, "LC_ALL": "C"},
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            **child_options(),
         )
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError("ps timed out") from exc
     text = (done.stdout or "").strip()
-    if not text:
+    # POSIX ps documents status 1 for an empty selection. Any diagnostic,
+    # other status or malformed output is an outage, not process death.
+    if done.returncode == 1 and not text and not (done.stderr or "").strip():
         return None
+    if done.returncode != 0 or (done.stderr or "").strip() or not text:
+        raise OSError("ps could not verify process identity")
     pid_text, _, start = text.partition(" ")
     try:
         if int(pid_text) != pid:
-            return None
+            raise OSError("ps returned a different process")
     except ValueError:
-        return None
-    start = " ".join(start.split())
-    return start or None
+        raise OSError("ps returned an invalid process identity") from None
+    canonical = _canonical_process_start(start, pid=pid)
+    if canonical is None or canonical[0] != "posix":
+        raise OSError("ps returned an invalid process start time")
+    return canonical[1]
 
 
 def probe_url(url: str, *, timeout: float = URL_TIMEOUT, deadline: float = URL_DEADLINE,

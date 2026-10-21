@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import urllib.parse
 
 from docket import __version__
 from docket.client import ClientError, request, resolve_url
@@ -67,12 +68,23 @@ def main(argv: list[str] | None = None) -> int:
 
     listing = sub.add_parser("list", help="list items")
     listing.add_argument("--status", default="pending", help="pending (includes firing, admitted, ambiguous), all, delivered, completed, cancelled, undeliverable, expired")
+    listing.add_argument("--outcome", default=None, help="delivery outcome filter")
     listing.add_argument("--json", action="store_true")
 
     occurrences = sub.add_parser("occurrences", help="list occurrence outcomes")
     occurrences.add_argument("id", nargs="?", help="item id; omit to list across items")
     occurrences.add_argument("--status", default=None, help="delivered, undeliverable, cancelled, pending")
     occurrences.add_argument("--json", action="store_true")
+
+    reconcile = sub.add_parser("reconcile", help="reconcile delivery state")
+    reconcile.add_argument("id", help="item or occurrence id")
+    reconcile.add_argument("--occurrence", action="store_true", help="target an occurrence rather than an item")
+    reconcile.add_argument("--json", action="store_true")
+
+    retry = sub.add_parser("retry", help="authorize one additional delivery attempt")
+    retry.add_argument("id", help="item or occurrence id")
+    retry.add_argument("--occurrence", action="store_true", help="target an occurrence rather than an item")
+    retry.add_argument("--json", action="store_true")
 
     cancel = sub.add_parser("cancel", help="cancel a pending item")
     cancel.add_argument("id")
@@ -110,9 +122,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "watch":
             return _create("watch", args)
         if args.command == "list":
-            return _list(args.status, args.json)
+            return _list(args.status, args.json, args.outcome)
         if args.command == "occurrences":
             return _occurrences(args.id, args.status, args.json)
+        if args.command == "reconcile":
+            return _reconcile(args.id, args.occurrence, args.json)
+        if args.command == "retry":
+            return _retry(args.id, args.occurrence, args.json)
         if args.command == "cancel":
             return _cancel(args.id, args.json)
         if args.command == "service":
@@ -122,6 +138,15 @@ def main(argv: list[str] | None = None) -> int:
             from docket.mcp_server import serve
             return serve()
     except ClientError as exc:
+        if getattr(args, "json", False):
+            payload = exc.payload
+            if not isinstance(payload, dict):
+                err = {"detail": exc.detail}
+                if exc.code:
+                    err["code"] = exc.code
+                payload = {"error": err}
+            print(json.dumps(payload))
+            return 1
         print(f"docket: {exc.detail}", file=sys.stderr)
         return 1
     return 2
@@ -129,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", required=True, help="target session id")
+    parser.add_argument("--adapter", choices=("opencode", "pi"), default=None,
+                        help="optional target adapter; omitted keeps normal OpenCode delivery")
     parser.add_argument("--reason", required=True)
     parser.add_argument("--urgent", action="store_true")
     parser.add_argument("--context", default=None, help="JSON object")
@@ -181,6 +208,8 @@ def _create(kind: str, args) -> int:
         "created_by": args.created_by,
         "directory": args.directory,
     }
+    if args.adapter is not None:
+        body["adapter"] = args.adapter
     if args.context:
         try:
             body["context"] = json.loads(args.context)
@@ -222,8 +251,11 @@ def _create(kind: str, args) -> int:
     return 0
 
 
-def _list(status: str, as_json: bool) -> int:
-    _status, payload = request("GET", f"/api/v1/items?status={status}")
+def _list(status: str, as_json: bool, outcome: str | None = None) -> int:
+    path = f"/api/v1/items?status={urllib.parse.quote(status, safe='')}"
+    if outcome:
+        path += f"&outcome={urllib.parse.quote(outcome, safe='')}"
+    _status, payload = request("GET", path)
     if as_json:
         print(json.dumps(payload))
         return 0
@@ -232,13 +264,26 @@ def _list(status: str, as_json: bool) -> int:
         print(f"docket: no {status} items ({resolve_url()})")
         return 0
     for item in items:
+        delivery = item.get("delivery") if isinstance(item.get("delivery"), dict) else {}
+        deliv_outcome = delivery.get("outcome") or "unknown"
         flags = []
         if item.get("urgent"):
             flags.append("urgent")
         if item.get("late"):
             flags.append("late")
-        if item.get("error"):
-            flags.append(item["error"])
+        issue_info = delivery.get("issue") or delivery.get("check_issue")
+        if isinstance(issue_info, dict):
+            code = issue_info.get("code")
+            detail_msg = issue_info.get("detail")
+            if isinstance(code, str) and code:
+                if isinstance(detail_msg, str) and detail_msg and detail_msg != code:
+                    flags.append(f"issue={code}:{detail_msg}")
+                else:
+                    flags.append(f"issue={code}")
+            elif isinstance(detail_msg, str) and detail_msg:
+                flags.append(f"issue={detail_msg}")
+        elif item.get("error"):
+            flags.append(str(item["error"]))
         extra = ("  " + ", ".join(flags)) if flags else ""
         target = (item.get("target") or {}).get("session_id", "")
         spec = item.get("spec") or {}
@@ -250,17 +295,18 @@ def _list(status: str, as_json: bool) -> int:
         missed = (item.get("occurrences") or {}).get("undeliverable")
         if missed:
             detail += f"  undeliverable_occurrences={missed}"
-        print(f"{item['id']}  {item['status']:13}  {item['fire_at']}  {target}  {item['reason']}{detail}{extra}")
+        print(f"{item['id']}  {item['status']:13}  outcome={deliv_outcome}  {item['fire_at']}  {target}  {item['reason']}{detail}{extra}")
     return 0
 
 
 def _occurrences(item_id: str | None, status: str | None, as_json: bool) -> int:
     if item_id:
-        path = f"/api/v1/items/{item_id}/occurrences"
+        encoded = urllib.parse.quote(item_id, safe="")
+        path = f"/api/v1/items/{encoded}/occurrences"
     else:
         path = "/api/v1/occurrences"
         if status:
-            path += f"?status={status}"
+            path += f"?status={urllib.parse.quote(status, safe='')}"
     _status, payload = request("GET", path)
     if item_id and status:
         payload = {
@@ -277,24 +323,79 @@ def _occurrences(item_id: str | None, status: str | None, as_json: bool) -> int:
         print("docket: no occurrences")
         return 0
     for occ in found:
+        delivery = occ.get("delivery") if isinstance(occ.get("delivery"), dict) else {}
+        deliv_outcome = delivery.get("outcome") or "unknown"
         flags = []
         if occ.get("late"):
             flags.append("late")
         if occ.get("coalesced"):
             flags.append(f"coalesced={occ['coalesced']}")
-        if occ.get("error"):
-            flags.append(occ["error"])
+        issue_info = delivery.get("issue") or delivery.get("check_issue")
+        if isinstance(issue_info, dict):
+            code = issue_info.get("code")
+            detail_msg = issue_info.get("detail")
+            if isinstance(code, str) and code:
+                if isinstance(detail_msg, str) and detail_msg and detail_msg != code:
+                    flags.append(f"issue={code}:{detail_msg}")
+                else:
+                    flags.append(f"issue={code}")
+            elif isinstance(detail_msg, str) and detail_msg:
+                flags.append(f"issue={detail_msg}")
+        elif occ.get("error"):
+            flags.append(str(occ["error"]))
         extra = ("  " + ", ".join(flags)) if flags else ""
-        print(f"{occ['id']}  {occ['status']:14}  {occ['scheduled_at']}  {occ['item_id']}  seq={occ['seq']}{extra}")
+        print(f"{occ['id']}  {occ['status']:14}  outcome={deliv_outcome}  {occ['scheduled_at']}  {occ['item_id']}  seq={occ['seq']}{extra}")
+    return 0
+
+
+def _reconcile(ident: str, is_occurrence: bool, as_json: bool) -> int:
+    encoded = urllib.parse.quote(ident, safe="")
+    path = f"/api/v1/occurrences/{encoded}/reconcile" if is_occurrence else f"/api/v1/items/{encoded}/reconcile"
+    _status, payload = request("POST", path, {})
+    if as_json:
+        print(json.dumps(payload))
+        return 0
+    unit = payload.get("occurrence") or payload.get("item") or {}
+    status = unit.get("status") or "unknown"
+    delivery = unit.get("delivery") if isinstance(unit.get("delivery"), dict) else {}
+    outcome = delivery.get("outcome") or "unknown"
+    issue_info = delivery.get("issue") or delivery.get("check_issue")
+    issue_str = ""
+    if isinstance(issue_info, dict):
+        code = issue_info.get("code")
+        detail = issue_info.get("detail")
+        if isinstance(code, str) and code:
+            if isinstance(detail, str) and detail and detail != code:
+                issue_str = f"  issue={code}:{detail}"
+            else:
+                issue_str = f"  issue={code}"
+        elif isinstance(detail, str) and detail:
+            issue_str = f"  issue={detail}"
+    print(f"reconciled {ident}  status={status}  outcome={outcome}{issue_str}")
+    return 0
+
+
+def _retry(ident: str, is_occurrence: bool, as_json: bool) -> int:
+    encoded = urllib.parse.quote(ident, safe="")
+    path = f"/api/v1/occurrences/{encoded}/retry" if is_occurrence else f"/api/v1/items/{encoded}/retry"
+    _status, payload = request("POST", path, {})
+    if as_json:
+        print(json.dumps(payload))
+        return 0
+    print(f"authorized retry for {ident} (not delivered)")
     return 0
 
 
 def _cancel(item_id: str, as_json: bool) -> int:
-    _status, payload = request("POST", f"/api/v1/items/{item_id}/cancel", {})
+    encoded = urllib.parse.quote(item_id, safe="")
+    _status, payload = request("POST", f"/api/v1/items/{encoded}/cancel", {})
     if as_json:
         print(json.dumps(payload))
-    else:
-        print(f"cancelled {item_id}")
+        return 0
+    stopped = "schedule_stopped" if payload.get("schedule_stopped") else "schedule_not_stopped"
+    retraction = payload.get("retraction") if isinstance(payload.get("retraction"), dict) else {}
+    outcome = retraction.get("outcome") or "uncertain"
+    print(f"cancelled {item_id} ({stopped}, retraction={outcome})")
     return 0
 
 

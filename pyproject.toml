@@ -7,7 +7,10 @@ name = "docket"
 version = "0.3.0"
 description = "Local schedule service that wakes an agent session."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "tzlocal>=5.0; sys_platform == 'win32'",
+  "tzdata; sys_platform == 'win32'",
+]
 
 [project.scripts]
 docket = "docket.cli:main"

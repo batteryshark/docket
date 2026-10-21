@@ -24,6 +24,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "Target agent session id (ses_…)"},
+                "adapter": {"type": "string", "enum": ["opencode", "pi"], "description": "Optional target adapter; Pi requires pi/<id>. Omit for normal OpenCode delivery."},
                 "in": {"description": "Delay in seconds, or a duration like 20m or 'in 20 minutes'"},
                 "reason": {"type": "string"},
                 "urgent": {"type": "boolean", "description": "If true, may arrive mid-turn. Default waits for the turn to end."},
@@ -43,6 +44,7 @@ TOOLS = [
             "properties": {
                 "session_id": {"type": "string"},
                 "at": {"type": "string"},
+                "adapter": {"type": "string", "enum": ["opencode", "pi"]},
                 "reason": {"type": "string"},
                 "urgent": {"type": "boolean"},
                 "context": {"type": "object"},
@@ -63,6 +65,7 @@ TOOLS = [
                 "every": {"description": "Interval in seconds, or a duration like 15m. Minimum 60 seconds."},
                 "reason": {"type": "string"},
                 "count": {"type": "integer", "description": "Maximum wakes. Required if until is omitted. Max 100."},
+                "adapter": {"type": "string", "enum": ["opencode", "pi"]},
                 "until": {"description": "Duration or ISO-8601 timestamp. Required if count is omitted."},
                 "start": {"description": "First fire. Duration or ISO timestamp. Default is one interval from now."},
                 "urgent": {"type": "boolean"},
@@ -82,6 +85,7 @@ TOOLS = [
             "properties": {
                 "session_id": {"type": "string", "description": "Session to wake"},
                 "check": {"type": "string", "enum": ["file_appears", "file_stable", "process_ended", "url_answers", "session_idle"]},
+                "adapter": {"type": "string", "enum": ["opencode", "pi"]},
                 "until": {"description": "Duration or ISO-8601 timestamp. Required."},
                 "reason": {"type": "string"},
                 "every": {"description": "Poll interval. Defaults are conservative; URL polls are slower."},
@@ -249,6 +253,8 @@ def _item_body(arguments: dict, time_key: str) -> dict:
         time_key: arguments.get(time_key),
         "reason": arguments.get("reason"),
     }
+    if "adapter" in arguments:
+        body["adapter"] = arguments["adapter"]
     if "urgent" in arguments:
         body["urgent"] = arguments["urgent"]
     if "context" in arguments:
