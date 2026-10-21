@@ -31,28 +31,29 @@ from docket.parse import (
     require_bool,
     validate_session_id,
 )
-from docket.delivery import (
-    AMBIGUOUS,
-    CONSUMED,
-    FAILED,
-    LOST,
-    MISSING,
-    RETRACTED,
-    retract_admission,
-)
 from docket.scheduler import log_scheduler_error
 from docket.store import OUTSTANDING, Item
+from docket.delivery_state import issue, project, receipt_projection
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8768
 MAX_BODY_BYTES = 65536
 BODY_READ_SECONDS = 5.0
-SEND_WAIT_SECONDS = 3.0
 
 
 class DocketServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self):
+        from docket.platform import is_windows
+        if is_windows():
+            import socket
+            # SO_REUSEADDR on Windows can allow another listener to steal the
+            # address. Set exclusive use before bind; never enable reuse there.
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        return super().server_bind()
 
     def __init__(self, store, scheduler, token: str, host: str = DEFAULT_HOST,
                  port: int = DEFAULT_PORT):
@@ -111,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._boundary_ok():
             return self._error(403, "forbidden", "loopback only")
         path, query = self._split()
+        if "view" in query:
+            return self._panel_read(path, query)
         if path == "/health":
             outstanding = self.server.store.list_outstanding()
             return self._send(200, {
@@ -134,6 +137,11 @@ class Handler(BaseHTTPRequestHandler):
                 ],
                 "outstanding": list(OUTSTANDING),
                 "limits": public_limits(),
+                "delivery_contract": {"version": 1, "writer_format": 1,
+                    "operations": ["reconcile", "retry"],
+                    "retry_policy": "one explicit same-unit authorization; no budget reset",
+                    "opencode_replay_after_possible_dispatch": False,
+                    "same_daemon_pre_dispatch_recovery": True},
             })
         if path == "/api/v1/items":
             status = query.get("status")
@@ -145,15 +153,19 @@ class Handler(BaseHTTPRequestHandler):
                 items = self.server.store.list()
             else:
                 items = self.server.store.list(status)
-            counts = self.server.store.occurrence_counts()
-            opens = self.server.store.open_summaries()
-            return self._send(200, {"items": [_with_counts(item, counts, opens) for item in items]})
+            bodies = [_public_item(self.server.store, item) for item in items]
+            if query.get("outcome"):
+                bodies = [body for body in bodies if body["delivery"]["outcome"] == query["outcome"]]
+            return self._send(200, {"items": bodies})
         if path == "/api/v1/occurrences":
             status = query.get("status")
             if status == "all":
                 status = None
             found = self.server.store.list_occurrences(status=status)
-            return self._send(200, {"occurrences": [occ.public() for occ in found]})
+            bodies = [_public_occurrence(self.server.store, occ) for occ in found]
+            if query.get("outcome"):
+                bodies = [body for body in bodies if body["delivery"]["outcome"] == query["outcome"]]
+            return self._send(200, {"occurrences": bodies})
         if path.startswith("/api/v1/items/"):
             rest = path[len("/api/v1/items/"):]
             if "/" in rest:
@@ -162,14 +174,14 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.store.get(item_id) is None:
                         return self._error(404, "not_found", "no such item")
                     found = self.server.store.list_occurrences(item_id)
-                    return self._send(200, {"occurrences": [occ.public() for occ in found]})
+                    return self._send(200, {"occurrences": [_public_occurrence(self.server.store, occ) for occ in found]})
                 return self._error(404, "not_found", "no such path")
             item = self.server.store.get(rest)
             if item is None:
                 return self._error(404, "not_found", "no such item")
-            body = _with_counts(item, self.server.store.occurrence_counts())
+            body = _public_item(self.server.store, item)
             recent = self.server.store.list_occurrences(item.id, limit=10)
-            body["recent_occurrences"] = [occ.public() for occ in recent]
+            body["recent_occurrences"] = [_public_occurrence(self.server.store, occ) for occ in recent]
             return self._send(200, {"item": body})
         return self._error(404, "not_found", "no such path")
 
@@ -182,6 +194,13 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if body is None:
             return
+        for prefix, is_occurrence in (("/api/v1/items/", False), ("/api/v1/occurrences/", True)):
+            if path.startswith(prefix):
+                rest = path[len(prefix):].split("/")
+                if len(rest) == 2 and rest[1] in ("reconcile", "retry"):
+                    if body:
+                        return self._error(400, "invalid", issue("invalid")["detail"])
+                    return self._recover(rest[0], rest[1], is_occurrence)
         if path == "/api/v1/timers":
             return self._create("timer", body)
         if path == "/api/v1/alarms":
@@ -202,6 +221,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._cancel(item_id)
         return self._error(404, "not_found", "no such path")
 
+    def _panel_read(self, path, query):
+        # Opt-in only. No caller-selected fields, order, limits or outcome filters.
+        pairs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+        if (query.get("view") != "panel" or set(pairs) - {"view", "status"}
+                or any(len(values) != 1 for values in pairs.values())):
+            return self._error(400, "invalid", "unsupported panel query")
+        status = query.get("status")
+        if path == "/api/v1/items" and status in ("outstanding", "terminal"):
+            items, truncated = self.server.store.panel_items(status)
+            limit = 200 if status == "outstanding" else 40
+            order = "fire_at,id" if status == "outstanding" else "updated_at_desc,id_desc"
+            return self._send(200, {"items": [_panel_item(self.server.store, item) for item in items],
+                                    "window": _panel_window(limit, order, truncated)})
+        if path == "/api/v1/occurrences" and status == "all":
+            rows, truncated = self.server.store.panel_occurrences()
+            return self._send(200, {"occurrences": [_panel_occurrence(self.server.store, row) for row in rows],
+                                    "window": _panel_window(40, "updated_at_desc,id_desc", truncated)})
+        if path.startswith("/api/v1/items/") and "/" not in path[len("/api/v1/items/"):] and set(pairs) == {"view"}:
+            item = self.server.store.get(path[len("/api/v1/items/"):])
+            if item is None:
+                return self._error(404, "not_found", "no such item")
+            return self._send(200, {"item": _panel_item(self.server.store, item)})
+        return self._error(400, "invalid", "unsupported panel query")
+
     def _create(self, kind: str, body: dict):
         with self.server._mutate:
             return self._create_locked(kind, body)
@@ -214,18 +257,30 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self._error(400, "invalid", str(exc))
         session_id = body.get("session_id") or ""
-        bad = validate_session_id(session_id)
+        selection = body.get("adapter", "opencode")
+        if selection not in ("opencode", "pi"):
+            return self._error(400, "unsupported_capability", issue("unsupported_capability")["detail"])
+        adapter = self.server.scheduler.adapter_for_target({"adapter": selection})
+        pi_target = selection == "pi"
+        bad = adapter.validate_target_id(session_id) if pi_target else validate_session_id(session_id)
         if bad:
             return self._error(400, "bad_target", bad)
         directory = body.get("directory")
         if directory is not None and (not isinstance(directory, str) or not directory.strip()):
             return self._error(400, "invalid", "directory must be a path")
         target = {
-            "adapter": "opencode",
+            "adapter": "pi" if pi_target else "opencode",
             "session_id": session_id,
         }
         if directory:
             target["directory"] = directory
+        if pi_target:
+            if directory or (kind == "watch" and body.get("check") == "session_idle"):
+                return self._error(400, "unsupported_capability", issue("unsupported_capability")["detail"])
+            try:
+                target["provider_binding"] = adapter.binding_snapshot()
+            except Exception:
+                return self._error(503, "backend_unverifiable", issue("backend_unverifiable")["detail"])
         now = self.server.scheduler.clock.now()
         try:
             if kind == "timer":
@@ -247,11 +302,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid", str(exc))
         except RuntimeError as exc:
             return self._error(503, "unavailable", str(exc))
-        check = self.server.scheduler.adapter.validate(target)
+        check = adapter.validate(target)
         if not check.ok:
             status = 503 if check.code == "unavailable" else 400
             return self._error(status, check.code, check.detail)
-        target["host"] = _host_status(self.server.scheduler.adapter)
+        target["host"] = _host_status(adapter)
         if kind == "watch" and spec and spec.get("check") == "session_idle":
             watched = spec.get("watch_session")
             if watched != session_id:
@@ -299,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
             spec=spec,
         )
         self.server.store.insert(item)
-        return self._send(201, {"item": item.public()})
+        return self._send(201, {"item": _public_item(self.server.store, item)})
 
     def _watched_state(self, session_id: str):
         adapter = self.server.scheduler.adapter
@@ -311,8 +366,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             state = adapter.session_state(session_id)
-        except Exception as exc:
-            return self._error(503, "unavailable", str(exc) or "session check unavailable")
+        except Exception:
+            return self._error(503, "unavailable", issue("unavailable")["detail"])
         if state == "missing":
             return self._error(400, "bad_target", "watched session not found")
         if state == "archived":
@@ -327,146 +382,33 @@ class Handler(BaseHTTPRequestHandler):
             if item is None:
                 return self._error(404, "not_found", "no such item")
             if item.status not in OUTSTANDING:
-                return self._terminal_cancel(item)
-            self._wait_for_send(item.id)
-            item = self.server.store.get(item_id) or item
-            if item.status not in OUTSTANDING:
-                return self._terminal_cancel(item)
-            aid = _cancel_admission_id(item, self.server.store.open_occurrence(item))
-            if aid and _admission_consumed(self.server.store, item.id, aid):
-                return self._stop_for_host(
-                    item, aid, CONSUMED, 409, "consumed",
-                    "not removed: the host already consumed this admission",
-                )
-            return self._cancel_outstanding(item)
-
-    def _wait_for_send(self, item_id: str) -> None:
-        """Let an in-flight deliver finish so cancel sees the host's answer.
-
-        The scheduler does not take ``_mutate``. Waiting here cannot deadlock
-        a deliver. A crash recovery has no in-flight send and does not wait.
-        """
-        scheduler = self.server.scheduler
-        sending = getattr(scheduler, "sending", None)
-        wait = getattr(scheduler, "wait_sending", None)
-        if not callable(sending) or not callable(wait) or not sending(item_id):
-            return
-        wait(item_id, SEND_WAIT_SECONDS)
-
-    def _cancel_outstanding(self, item):
-        occ = self.server.store.open_occurrence(item)
-        receipt = _cancel_receipt(item, occ)
-        aid = _admission_of(receipt)
-        target = item.target if isinstance(item.target, dict) else None
-        now = self.server.scheduler.clock.now()
-        if not aid:
-            result = self.server.store.cancel(item.id, now)
-            return self._cancelled_response(item.id, result, "none", None)
-        if not target or not target.get("session_id"):
-            self.server.store.note_outstanding_error(
-                item.id, now, "not removed: the admission has no session to retract",
-            )
-            return self._refuse(
-                503, AMBIGUOUS,
-                "not removed: the admission has no session to retract",
-                item.id, AMBIGUOUS, aid,
-            )
-        outcome = retract_admission(
-            self.server.scheduler.adapter, target, aid, confirmed=_confirmed(receipt),
-        )
-        if outcome == RETRACTED:
-            result = self.server.store.cancel(
-                item.id, now, receipt_state=RETRACTED, admission_id=aid, clear_error=True,
-            )
-            return self._cancelled_response(item.id, result, RETRACTED, aid)
-        if outcome == MISSING and (receipt or {}).get("state") != AMBIGUOUS:
-            result = self.server.store.cancel(
-                item.id, now, receipt_state=MISSING, admission_id=aid, clear_error=True,
-            )
-            return self._cancelled_response(item.id, result, MISSING, aid)
-        if outcome == CONSUMED:
-            return self._stop_for_host(
-                item, aid, CONSUMED, 409, "consumed",
-                "not removed: the host already consumed this admission",
-            )
-        if outcome == LOST:
-            # The host does not hold the prompt. Stopping the series is a
-            # completed cancel, not a live drop. The receipt records lost so
-            # a reader does not treat it as a witnessed retraction.
-            result = self.server.store.cancel(
-                item.id, now, receipt_state=LOST, admission_id=aid,
-                error="admitted prompt was not on the host",
-            )
-            return self._cancelled_response(item.id, result, LOST, aid)
-        if outcome == MISSING and (receipt or {}).get("state") == AMBIGUOUS:
-            return self._stop_for_host(
-                item, aid, AMBIGUOUS, 409, AMBIGUOUS,
-                "not removed: the admission was ambiguous and was not confirmed on the host",
-            )
-        if outcome == FAILED:
-            self.server.store.note_outstanding_error(
-                item.id, now, "retraction failed: the host still holds this admission",
-            )
-            return self._refuse(
-                409, "retraction_failed",
-                "not removed: the host still holds this admission",
-                item.id, FAILED, aid,
-            )
-        self.server.store.note_outstanding_error(
-            item.id, now, "not removed: the host could not be checked, so the admission was not dropped",
-        )
-        return self._refuse(
-            503, AMBIGUOUS,
-            "not removed: the host could not be checked, so the admission was not dropped",
-            item.id, AMBIGUOUS, aid,
-        )
-
-    def _stop_for_host(self, item, aid: str, state: str, status: int, code: str, detail: str):
-        """Stop later wakes without claiming the prompt was dropped."""
-        now = self.server.scheduler.clock.now()
-        if item.status in OUTSTANDING:
-            self.server.store.cancel(
-                item.id, now, receipt_state=state, error=detail, admission_id=aid,
-            )
-        return self._refuse(status, code, detail, item.id, state, aid)
-
-    def _terminal_cancel(self, item):
-        state = (item.receipt or {}).get("state")
-        if item.status in ("delivered", "completed") or state == CONSUMED:
-            return self._refuse(
-                409, "consumed",
-                "not removed: the host already consumed this admission",
-                item.id, CONSUMED, _admission_of(item.receipt),
-            )
-        if item.status == "undeliverable" or state == LOST:
-            return self._refuse(
-                409, "lost",
-                "not removed: the admitted prompt is neither in the inbox nor the transcript",
-                item.id, LOST, _admission_of(item.receipt),
-            )
-        return self._error(409, "conflict", "item is not pending")
-
-    def _cancelled_response(self, item_id: str, result: str, outcome: str, aid: str | None):
-        if result == "missing":
-            return self._error(404, "not_found", "no such item")
-        if result != "cancelled":
+                code = "already_consumed" if item.status == "delivered" else "schedule_finished"
+                return self._send(409, {"error": issue(code), "item": _public_item(self.server.store, item),
+                                        "schedule_stopped": item.status == "cancelled",
+                                        "retraction": {"outcome": "uncertain"}})
+            outcome = self.server.scheduler.stop(item)
             fresh = self.server.store.get(item_id)
-            if fresh is not None:
-                return self._terminal_cancel(fresh)
-            return self._error(409, "conflict", "item is not pending")
-        fresh = self.server.store.get(item_id)
-        return self._send(200, {
-            "item": fresh.public() if fresh else {"id": item_id, "status": "cancelled"},
-            "retraction": {"outcome": outcome, "admission_id": aid},
-        })
+            return self._send(200, {"item": _public_item(self.server.store, fresh), "schedule_stopped": True,
+                                    "retraction": {"outcome": outcome}})
 
-    def _refuse(self, status: int, code: str, detail: str, item_id: str, outcome: str, aid: str | None):
-        fresh = self.server.store.get(item_id)
-        self._send(status, {
-            "error": {"code": code, "detail": detail},
-            "item": fresh.public() if fresh else {"id": item_id},
-            "retraction": {"outcome": outcome, "admission_id": aid},
-        })
+    def _recover(self, ident, action, is_occurrence):
+        with self.server._mutate:
+            occ = self.server.store.get_occurrence(ident) if is_occurrence else None
+            item = self.server.store.get(occ.item_id if occ else ident) if (occ or not is_occurrence) else None
+            if not item:
+                return self._error(404, "not_found", "no such delivery unit")
+            if not is_occurrence and item.kind in ("watch", "recurring"):
+                return self._send(409, {"error": issue("not_ready"), "item": _public_item(self.server.store, item)})
+            status, code = self.server.scheduler.recover(item, occ, action)
+            fresh = self.server.store.get(item.id)
+            body = {"item": _public_item(self.server.store, fresh), "operation": action,
+                    "authorized": status == 202}
+            if occ:
+                body["occurrence"] = _public_occurrence(self.server.store, self.server.store.get_occurrence(occ.id))
+            if code:
+                body["error"] = issue(code, phase=action, certainty="unknown")
+            return self._send(status, body)
+
 
     def _boundary_ok(self) -> bool:
         host = (self.headers.get("Host") or "").split(":")[0]
@@ -491,6 +433,11 @@ class Handler(BaseHTTPRequestHandler):
     def _split(self):
         parsed = urllib.parse.urlsplit(self.path)
         query = {key: values[-1] for key, values in urllib.parse.parse_qs(parsed.query).items()}
+        # Preserve an explicitly empty new opt-in parameter so it is rejected;
+        # retain historical blank handling for every existing parameter.
+        views = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("view")
+        if views is not None:
+            query["view"] = views[-1]
         return parsed.path.rstrip("/") or "/", query
 
     def _body(self) -> dict | None:
@@ -542,13 +489,6 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, {"error": {"code": code, "detail": detail}})
 
 
-def _admission_of(receipt) -> str | None:
-    if not isinstance(receipt, dict):
-        return None
-    aid = receipt.get("inbox_id") or receipt.get("admission_id")
-    return aid if isinstance(aid, str) and aid else None
-
-
 def _host_status(adapter) -> dict:
     status = getattr(adapter, "host_status", None)
     if callable(status):
@@ -556,51 +496,133 @@ def _host_status(adapter) -> dict:
     return {"adapter": getattr(adapter, "name", "unknown"), "mode": "generic-opencode"}
 
 
-def _cancel_receipt(item, occ):
-    occ_receipt = occ.receipt if occ is not None else None
-    if _admission_of(occ_receipt):
-        return occ_receipt
-    if _admission_of(item.receipt if item is not None else None):
-        return item.receipt
-    return occ_receipt or (item.receipt if item is not None else None)
-
-
-def _cancel_admission_id(item, occ) -> str | None:
-    return _admission_of(_cancel_receipt(item, occ))
-
-
-def _confirmed(receipt) -> bool:
-    if not isinstance(receipt, dict):
-        return False
-    if receipt.get("inbox_id"):
-        return True
-    return receipt.get("state") in ("admitted", LOST)
-
-
-def _admission_consumed(store, item_id: str, aid: str) -> bool:
-    item = store.get(item_id)
-    if item is not None and _receipt_has(item.receipt, aid) and (
-        item.status in ("delivered", "completed") or (item.receipt or {}).get("state") == CONSUMED
-    ):
-        return True
-    for occ in store.list_occurrences(item_id):
-        if _receipt_has(occ.receipt, aid) and (
-            occ.status == "delivered" or (occ.receipt or {}).get("state") == CONSUMED
-        ):
-            return True
-    return False
-
-
-def _receipt_has(receipt, aid: str) -> bool:
-    if not isinstance(receipt, dict):
-        return False
-    return receipt.get("admission_id") == aid or receipt.get("inbox_id") == aid
-
-
 def _with_counts(item: Item, counts: dict, opens: dict | None = None) -> dict:
     body = item.public()
     body["occurrences"] = counts.get(item.id, {})
-    body["delivery_state"] = (item.receipt or {}).get("state")
+    body["delivery_state"] = receipt_projection(item.receipt, malformed=item.receipt_malformed)["state"]
     if opens and item.id in opens:
         body["open_occurrence"] = opens[item.id]
     return body
+
+
+def _safe_legacy(body, delivery, *, receipt_malformed=False):
+    if isinstance(body.get("target"), dict):
+        body["target"] = {key: value for key, value in body["target"].items() if key != "provider_binding"}
+    diagnostic = delivery.get("issue") or delivery.get("check_issue")
+    if body.get("error"):
+        body["error"] = diagnostic["detail"] if diagnostic else issue("unavailable")["detail"]
+    receipt = body.get("receipt")
+    typed = receipt_projection(receipt, malformed=receipt_malformed)
+    body["receipt_issue"] = typed["issue"]
+    if isinstance(receipt, dict):
+        body["receipt"] = {key: typed[key] for key in ("admission_id", "inbox_id", "delivery", "state")
+                           if key in receipt}
+    elif receipt is not None:
+        body["receipt"] = None
+    body["delivery"] = delivery
+    return body
+
+
+def _public_item(store, item):
+    occ = store.open_occurrence(item)
+    body = _with_counts(item, store.occurrence_counts(), store.open_summaries())
+    body = _safe_legacy(body, project(store, item, occ), receipt_malformed=item.receipt_malformed)
+    # open_summaries sanitizes every row, even if this parent's pointer is broken.
+    return _item_delivery_summary(store, item, body)
+
+
+def _item_delivery_summary(store, item, body):
+    if item.kind == "recurring":
+        summary = {}
+        for row in store.list_occurrences(item.id):
+            key = project(store, item, row)["outcome"]
+            summary[key] = summary.get(key, 0) + 1
+        body["delivery_summary"] = summary
+        body["coalesced_slots"] = sum(row.coalesced for row in store.list_occurrences(item.id))
+    return body
+
+
+def _public_occurrence(store, occ):
+    item = store.get(occ.item_id)
+    return _safe_legacy(occ.public(), project(store, item, occ), receipt_malformed=occ.receipt_malformed)
+
+
+def _panel_window(limit, order, truncated):
+    return {"view": "panel", "limit": limit, "order": order, "truncated": truncated}
+
+
+def _panel_compact(body, *, occurrence=False):
+    """Bound display text only, using the shared typed delivery projection as truth.
+
+    Fewer than 8,000 Unicode code points and 8,192 ASCII structural/numeric bytes
+    per row: at most 12 * 8,000 + 8,192 bytes with json.dumps ensure_ascii=True.
+    Context, host metadata, receipts and raw diagnostics are never serialized.
+    """
+    truncated = False
+
+    def text(value, limit):
+        nonlocal truncated
+        if not isinstance(value, str):
+            return None
+        truncated |= len(value) > limit
+        return value[:limit]
+
+    def number(value):
+        nonlocal truncated
+        if value is None:
+            return None
+        if type(value) in (int, float) and -(2**53 - 1) <= value <= 2**53 - 1:
+            return value
+        truncated = True
+        return None
+
+    result = {key: text(body.get(key), limit) for key, limit in (
+        ("id", 20), ("kind", 40), ("status", 40), ("fire_at", 50), ("updated_at", 50),
+        ("reason", 2000), ("created_by", 300))}
+    for key in ("urgent", "late"):
+        result[key] = body.get(key)
+    result["late_by_seconds"] = number(body.get("late_by_seconds"))
+    if occurrence:
+        result.update(item_id=text(body.get("item_id"), 20), seq=number(body.get("seq")),
+                      scheduled_at=text(body.get("scheduled_at"), 50))
+    else:
+        target, spec = body.get("target") or {}, body.get("spec") or {}
+        result["target"] = {"session_id": text(target.get("session_id"), 300),
+                            "directory": text(target.get("directory"), 1000)}
+        result["spec"] = {"check": text(spec.get("check"), 80), "every": number(spec.get("every"))}
+        result["open_occurrence"] = {"id": text((body.get("open_occurrence") or {}).get("id"), 20)}
+        summary = body.get("delivery_summary")
+        result["delivery_summary"] = None if summary is None else {
+            key: number(summary[key]) for key in (
+                "pending", "admitted", "delivered", "failed", "uncertain", "cancelled", "not_applicable") if key in summary}
+        result["coalesced_slots"] = number(body.get("coalesced_slots"))
+    delivery = body["delivery"]
+    result["delivery"] = {key: delivery[key] for key in (
+        "facts", "stale", "namespace_verified", "same_daemon_recovery")}
+    for key, limit in (("unit_id", 20), ("request_id", 36), ("outcome", 40), ("phase", 40),
+                       ("execution", 40), ("evidence", 40), ("last_checked_at", 50)):
+        result["delivery"][key] = text(delivery.get(key), limit)
+    recovery = delivery["recovery"]
+    result["delivery"]["recovery"] = {"reconcile": recovery["reconcile"], "retry": recovery["retry"],
+                                        "refusal_code": text(recovery.get("refusal_code"), 40)}
+    for key in ("issue", "check_issue", "receipt_issue"):
+        diagnostic = delivery.get(key)
+        result["delivery"][key] = None if diagnostic is None else {
+            field: text(diagnostic.get(field), limit) for field, limit in (
+                ("code", 40), ("detail", 500), ("phase", 40), ("admission_certainty", 40))}
+    result["fields_truncated"] = truncated
+    return result
+
+
+def _panel_item(store, item):
+    # Do not compute the unused global occurrence_counts grouped over all old
+    # parents. Delivery and bounded recurring summary are the same shared reads
+    # as the default view, without its compatibility/diagnostic containers.
+    body = item.public()
+    body["delivery"] = project(store, item, store.open_occurrence(item))
+    body["open_occurrence"] = store.open_summaries().get(item.id)
+    return _panel_compact(_item_delivery_summary(store, item, body))
+
+
+def _panel_occurrence(store, occ):
+    return _panel_compact(_public_occurrence(store, occ), occurrence=True)

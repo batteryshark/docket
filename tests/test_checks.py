@@ -6,6 +6,7 @@ import http.server
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -60,7 +61,8 @@ class FileCheckTests(unittest.TestCase):
 
 class ProcessCheckTests(unittest.TestCase):
     def test_running_process_and_exit(self):
-        proc = subprocess.Popen(["sleep", "30"])
+        from docket.platform import child_options
+        proc = subprocess.Popen([sys.executable, "-I", "-B", "-c", "import time; time.sleep(30)"], **child_options())
         try:
             start = read_process_start(proc.pid)
             self.assertTrue(start)
@@ -81,18 +83,29 @@ class ProcessCheckTests(unittest.TestCase):
 
     def test_pid_reuse_is_ended_and_ps_failure_is_not(self):
         def reader(_pid):
-            return "other start"
+            return "Fri Oct 16 12:05:00 2026"
 
         reused = Checks(process_reader=reader).evaluate({
-            "check": "process_ended", "pid": 50, "process_start": "original start",
+            "check": "process_ended", "pid": 50, "process_start": "Fri Oct 16 12:00:00 2026",
         }, utc(2026, 10, 16, 12))
         self.assertEqual(reused.summary["ended"], "pid_reused")
+
+        incomparable = Checks(process_reader=reader).evaluate({
+            "check": "process_ended", "pid": 50, "process_start": "ven. 16 oct. 12:00:00 2026",
+        }, utc(2026, 10, 16, 12))
+        self.assertEqual(incomparable.kind, "unavailable")
+
+        exited_legacy = Checks(process_reader=lambda _pid: None).evaluate({
+            "check": "process_ended", "pid": 50, "process_start": "ven. 16 oct. 12:00:00 2026",
+        }, utc(2026, 10, 16, 12))
+        self.assertEqual(exited_legacy.kind, "met")
+        self.assertEqual(exited_legacy.summary["ended"], "exited")
 
         def down(_pid):
             raise TimeoutError("ps timed out")
 
         outage = Checks(process_reader=down).evaluate({
-            "check": "process_ended", "pid": 50, "process_start": "original start",
+            "check": "process_ended", "pid": 50, "process_start": "Fri Oct 16 12:00:00 2026",
         }, utc(2026, 10, 16, 12))
         self.assertEqual(outage.kind, "unavailable")
         with self.assertRaises(ValueError):
@@ -168,9 +181,15 @@ class UrlCheckTests(unittest.TestCase):
                 probe_url(f"http://127.0.0.1:{port}/hang", timeout=0.3, deadline=0.6)
         finally:
             sock.close()
-        refused = Checks().evaluate({
-            "check": "url_answers", "url": "http://127.0.0.1:9/nope", "expect": "2xx",
+        calls = []
+        def connection_refused(url):
+            calls.append(url)
+            raise ConnectionRefusedError("injected refusal")
+
+        refused = Checks(url_probe=connection_refused).evaluate({
+            "check": "url_answers", "url": "http://refusal.invalid/nope", "expect": "2xx",
         }, utc(2026, 10, 16, 12))
+        self.assertEqual(calls, ["http://refusal.invalid/nope"])
         self.assertEqual(refused.kind, "waiting")
         self.assertNotIn("body", refused.summary or {})
 

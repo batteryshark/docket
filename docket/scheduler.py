@@ -5,10 +5,9 @@ not turned into a command.
 
 Admission is not consumption. A 200 from the host means the prompt was
 admitted. ``delivered`` is recorded only after that stable id is in the
-session transcript. A confirmed admission that later vanishes is
-``undeliverable`` (lost), not delivered, and it is not sent again. An
-unconfirmed send is retried with the same id. A conflict whose id cannot be
-found is ``ambiguous`` and is not given a new id.
+session transcript. Missing or unreadable evidence after possible dispatch
+is uncertain and status-only. Only proven pre-dispatch failures can retry,
+using the original frozen body and the same daemon's unchanged binding.
 
 A recurring item keeps one parent row and a distinct occurrence for each wake.
 The admission id belongs to that occurrence. A later repeat is a new
@@ -24,6 +23,7 @@ later flips. An outage is not a match.
 from __future__ import annotations
 
 import sys
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -37,16 +37,10 @@ from docket.bounds import (
     slot_allowed,
 )
 from docket.checks import URL_DEADLINE, CheckExecutor, Checks
-from docket.delivery import (
-    AMBIGUOUS,
-    CONSUMED,
-    FAILED,
-    DeliveryError,
-    retract_admission,
-    scrub,
-)
-from docket.parse import is_late, late_by_seconds, new_admission_id, new_occurrence_id, wake_text
+from docket.delivery import DeliveryError, Receipt
+from docket.parse import is_late, late_by_seconds, new_occurrence_id, wake_text
 from docket.store import Occurrence
+from docket.delivery_state import issue, project, retry_refusal
 
 LEASE_SECONDS = 60
 MAX_ATTEMPTS = 8
@@ -55,18 +49,382 @@ OPEN = ("pending", "firing", "admitted", "ambiguous")
 
 
 class Scheduler:
-    def __init__(self, store, adapter, clock, checks=None, check_executor=None):
+    def __init__(self, store, adapter, clock, checks=None, check_executor=None, *, pi_adapter=None):
         self.store = store
         self.adapter = adapter
+        self._pi_adapter = pi_adapter
         self.clock = clock
         self.checks = checks or Checks(adapter)
         self.check_executor = check_executor or CheckExecutor()
         self._inflight: dict[str, str] = {}
         self._inflight_cv = threading.Condition()
+        self._gates: dict[str, threading.Lock] = {}
+        self._gates_lock = threading.Lock()
+        self._next_checks = {}
+
+    def _gate(self, item_id):
+        # Parent gate also serializes recurrence advancement and exact-unit recovery.
+        with self._gates_lock:
+            return self._gates.setdefault(item_id, threading.Lock())
+
+    def adapter_for_target(self, target):
+        """Two fixed local adapters; never change the shared default or use request argv."""
+        if target.get("adapter") == "pi":
+            with self._gates_lock:
+                if self._pi_adapter is None:
+                    from docket.pi import PiAdapter
+                    self._pi_adapter = PiAdapter()
+                return self._pi_adapter
+        if target.get("adapter") not in (None, "opencode"):
+            raise DeliveryError("unsupported_capability", not_dispatched=True)
+        return self.adapter
+
+    def _snapshot(self, target=None):
+        adapter = self.adapter_for_target(target) if target is not None else self.adapter
+        method = getattr(adapter, "binding_snapshot", None)
+        if callable(method):
+            return method()
+        # Compatibility for deterministic in-process adapters, not a namespace claim.
+        return {"adapter": adapter.name, "namespace_verified": False}
+
+    def _note_receipt(self, unit_id, result, *, phase):
+        facts = dict(result.raw.get("facts", {}))
+        prior = self.store.get_request(unit_id)["facts"]
+        # A provider snapshot cannot retract Docket's retained irreversible evidence.
+        contradictory_cancel = facts.get("cancelled") and any(
+            prior.get(key) for key in ("claimed", "injected", "consumed"))
+        if contradictory_cancel:
+            facts.pop("cancelled")
+        self.store.note_request(unit_id, facts=facts, diagnostic=(
+            issue("acceptance_unknown", phase=phase, certainty="unknown") if contradictory_cancel else None))
+        return "uncertain" if contradictory_cancel else result.state
+
+    def _status(self, item, occ, req):
+        frozen = req["frozen"]
+        target = frozen["target"] if frozen else item.target
+        adapter = self.adapter_for_target(target)
+        if frozen:
+            if self._snapshot(target) != frozen["binding"]:
+                raise DeliveryError("backend_unverifiable")
+            method = getattr(adapter, "status_frozen", None)
+            if callable(method):
+                result = method(frozen)
+                if isinstance(result, Receipt):
+                    state = self._note_receipt((occ or item).id, result, phase="status")
+                    if result.state == "failed" and any(req["facts"].get(k) for k in ("claimed", "injected", "consumed")):
+                        return "uncertain"
+                    return state
+                return result
+        # Legacy evidence may locate an ID but cannot recover a complete envelope.
+        if not req["request_id"]:
+            raise DeliveryError("legacy_identity_unknown")
+        return adapter.reconcile(target, req["request_id"])
+
+    def _reconcile_unit(self, item, occ=None, *, gate_held=False):
+        unit = occ or item
+        now = self.clock.now()
+        if self._next_checks.get(unit.id, now) > now:
+            return False
+        gate = self._gate(item.id)
+        if not gate_held and not gate.acquire(blocking=False):
+            return False
+        try:
+            self._next_checks[unit.id] = now + timedelta(seconds=30)
+            req = self.store.reserve_request(item, occ)
+            try:
+                found = self._status(item, occ, req)
+                if found not in ("consumed", "admitted", "missing", "uncertain", "failed"):
+                    raise DeliveryError("unavailable")
+            except Exception as exc:
+                code = exc.code if isinstance(exc, DeliveryError) else "unavailable"
+                self.store.note_request(unit.id, diagnostic=req["issue"],
+                                        checked_at=self.clock.now(), check_issue=issue(code, phase="status", certainty="unknown"))
+                return False
+            if found == "consumed":
+                if not req["frozen"] and not req["facts"].get("consumed"):
+                    self.store.note_request(unit.id, diagnostic=req["issue"], checked_at=now,
+                                            check_issue=issue("legacy_envelope_unknown", phase="status", certainty="unknown"))
+                    return False
+                self.store.note_request(unit.id, facts={"admitted": True, "consumed": True},
+                                        phase="consumed", checked_at=self.clock.now())
+                return self._consume(item, occ, req["request_id"], (unit.receipt or {}).get("delivery"))
+            if found == "failed":
+                return self._provider_failed(item, occ)
+            if found == "admitted":
+                self.store.note_request(unit.id, facts={"admitted": True}, phase="admitted", checked_at=self.clock.now())
+                if item.status != "cancelled":
+                    return self._note_admitted(item, occ, req["request_id"], (unit.receipt or {}).get("delivery"))
+                return True
+            if found == "uncertain":
+                self.store.note_request(unit.id, diagnostic=issue("acceptance_unknown", phase="status", certainty="unknown"), checked_at=now)
+                if item.status != "cancelled" and not self.store.get_request(unit.id)["facts"].get("consumed"):
+                    self._ambiguous(item, occ, req["request_id"], issue("acceptance_unknown")["detail"])
+                return True
+            # A missing snapshot never changes dispatch certainty or authorizes replay.
+            if self.store.get_request(unit.id)["facts"].get("cancelled"):
+                return True
+            if req["dispatch_state"] == "possible" or req["provenance"] == "legacy":
+                code = "lost" if req["facts"].get("admitted") else "acceptance_unknown"
+                self.store.note_request(unit.id, diagnostic=issue(code, phase="status", certainty="unknown"),
+                                        checked_at=self.clock.now())
+                if item.status != "cancelled":
+                    self._ambiguous(item, occ, req["request_id"], issue(code)["detail"])
+            else:
+                self.store.note_request(unit.id, diagnostic=req["issue"], checked_at=self.clock.now())
+            return True
+        finally:
+            if not gate_held:
+                gate.release()
+
+    def recover(self, item, occ, action):
+        gate = self._gate(item.id)
+        if not gate.acquire(blocking=False):
+            return 409, "in_flight"
+        try:
+            unit = occ or item
+            req = self.store.reserve_request(item, occ)
+            if action == "retry":
+                refusal = project(self.store, item, occ)["recovery"]["refusal_code"]
+                if refusal:
+                    return 409, refusal
+                if req["frozen"]:
+                    try:
+                        same = self._snapshot(req["frozen"]["target"]) == req["frozen"]["binding"]
+                    except Exception:
+                        same = False
+                    if not same:
+                        self.store.invalidate_binding(unit.id)
+                        return 409, "backend_unverifiable"
+                from docket.bounds import check_limits, LimitError
+                try:
+                    check_limits([row for row in self.store.active_items() if row.id != item.id],
+                                 kind=item.kind, session_id=item.target["session_id"], created_by=item.created_by)
+                except LimitError:
+                    return 409, "limits"
+                refusal = self.store.authorize_retry(unit.id, self.clock.now())
+                return (409, refusal) if refusal else (202, None)
+            if not req["request_id"]:
+                return 409, "legacy_identity_unknown"
+            self._next_checks.pop(unit.id, None)
+            self._reconcile_unit(item, occ, gate_held=True)
+            req = self.store.get_request(unit.id)
+            return (503, req["check_issue"]["code"]) if req["check_issue"] else (200, None)
+        finally:
+            gate.release()
+
+    def stop(self, item):
+        """Durable local stop first. Never confuse a missing snapshot with retraction."""
+        occ = self.store.open_occurrence(item)
+        unit = occ or item
+        req = self.store.reserve_request(item, occ)
+        self.store.cancel(item.id, self.clock.now())
+        # Re-read AFTER durable stop: begin_send may have won between reserve and cancel.
+        # Once stop is committed, begin_send cannot subsequently win.
+        req = self.store.get_request(unit.id)
+        if req["dispatch_state"] != "possible" and req["provenance"] != "legacy":
+            self.store.note_request(unit.id, facts={"cancelled": True}, phase="cancelled")
+            return "not_sent"
+        gate = self._gate(item.id)
+        if not gate.acquire(blocking=False):
+            return "uncertain"
+        try:
+            return self._retract_stopped(item, occ)
+        finally:
+            gate.release()
+
+    def _retract_stopped(self, item, occ):
+        unit = occ or item
+        req = self.store.get_request(unit.id)
+        if not req or not req["frozen"]:
+            return "uncertain"
+        try:
+            found = self._status(item, occ, req)
+            if found == "consumed":
+                self.store.note_request(unit.id, facts={"admitted": True, "consumed": True}, phase="consumed")
+                return "too_late"
+            if self.store.get_request(unit.id)["facts"].get("consumed"):
+                return "too_late"
+            adapter = self.adapter_for_target(req["frozen"]["target"])
+            method = getattr(adapter, "cancel_frozen", None)
+            if callable(method):
+                result = method(req["frozen"])
+                if isinstance(result, Receipt):
+                    self._note_receipt(unit.id, result, phase="cancel")
+                    facts = self.store.get_request(unit.id)["facts"]
+                    if facts.get("consumed"):
+                        return "too_late"
+                    if facts.get("cancelled"):
+                        return "retracted"
+                    if result.state == "too_late":
+                        # Irreversible claim is NOT proof of saved intake.
+                        self.store.note_request(unit.id, diagnostic=issue("acceptance_unknown", phase="cancel", certainty="unknown"))
+                        return "uncertain"
+            else:
+                adapter.cancel_admission(req["frozen"]["target"], req["request_id"])
+            after = self._status(item, occ, req)
+            if after == "consumed":
+                self.store.note_request(unit.id, facts={"admitted": True, "consumed": True}, phase="consumed")
+                return "too_late"
+        except Exception:
+            pass
+        self.store.note_request(unit.id, diagnostic=issue("acceptance_unknown", phase="cancel", certainty="unknown"))
+        return "uncertain"
+
+    def _render(self, item, occ, now):
+        plan = self._plan(item, occ, now) if occ else None
+        scheduled = occ.scheduled_at if occ else item.fire_at
+        extra = {} if not occ else {
+            "occurrence_id": occ.id, "coalesced": plan["coalesced"],
+            "check": (item.spec or {}).get("check"),
+            "summary": (occ.detail or {}).get("summary") or (item.spec or {}).get("summary"),
+            "next_fire": plan["next_fire"], "remaining": plan["remaining"],
+            "series_continues": plan["continues"], "previous_undeliverable": plan["previous"],
+        }
+        return wake_text(kind=item.kind, item_id=item.id, reason=item.reason, fire_at=scheduled,
+                         now=now, late=is_late(scheduled, now), urgent=item.urgent,
+                         created_by=item.created_by, context=item.context, **extra)
+
+    def _deliver_unit(self, item, occ=None):
+        unit = occ or item
+        gate = self._gate(item.id)
+        if not gate.acquire(blocking=False):
+            return False
+        try:
+            parent = self.store.get(item.id)
+            unit = self.store.get_occurrence(unit.id) if occ else parent
+            if not parent or not unit or parent.status == "cancelled" or unit.status != "pending":
+                return False
+            item, occ = parent, unit if occ else None
+            req = self.store.reserve_request(item, occ)
+            refusal = retry_refusal(req)
+            # Automatic sends may use the remaining original budget after a manual authorization.
+            if refusal == "retry_budget":
+                refusal = None
+            if refusal:
+                self.store.note_request(unit.id, diagnostic=issue(refusal, certainty="unknown"))
+                self._ambiguous(item, occ, req["request_id"], issue(refusal)["detail"])
+                return True
+            manual = bool(req["manual_pending"])
+            if unit.attempts >= MAX_ATTEMPTS and not manual:
+                return False
+            now = self.clock.now()
+            claimed = (self.store.claim_occurrence(unit.id, now, max_attempts=MAX_ATTEMPTS) if occ
+                       else self.store.claim(unit.id, now, max_attempts=MAX_ATTEMPTS))
+            if not claimed:
+                return False
+            unit = self.store.get_occurrence(unit.id) if occ else self.store.get(unit.id)
+            if occ:
+                occ = unit
+            else:
+                item = unit
+            try:
+                # Freeze text/body/target before validation so a later validation retry
+                # cannot change time-derived text. Binding discovery may itself be unavailable.
+                target = req["frozen"]["target"] if req["frozen"] else item.target
+                adapter = self.adapter_for_target(target)
+                snapshot = self._snapshot(target)
+                if not req["frozen"]:
+                    body = {"id": req["request_id"], "text": self._render(item, occ, now),
+                            "delivery": "steer" if item.urgent else "queue", "resume": True}
+                    prepare = getattr(adapter, "prepare_body", None)
+                    if callable(prepare):
+                        body = prepare(req["caller"], req["request_id"], body["text"], item.urgent, item.target)
+                    frozen = {"v": 1, "caller": req["caller"], "target": item.target,
+                              "urgent": item.urgent, "binding": snapshot,
+                              # Matches both urllib and the paired JSON transport exactly.
+                              "body": json.dumps(body, sort_keys=True)}
+                    req = self.store.freeze_request(unit.id, frozen)
+                elif snapshot != req["frozen"]["binding"]:
+                    self.store.invalidate_binding(unit.id)
+                    raise DeliveryError("backend_unverifiable")
+                if req["stop_requested"] or not req["frozen"]:
+                    return False
+                validate = getattr(adapter, "validate_frozen", None)
+                check = validate(req["frozen"]) if callable(validate) else adapter.validate(req["frozen"]["target"])
+                if not check.ok:
+                    raise DeliveryError(check.code, retryable=check.code == "unavailable")
+            except Exception as exc:
+                code = exc.code if isinstance(exc, DeliveryError) else "unavailable"
+                if code == "backend_unverifiable":
+                    self.store.invalidate_binding(unit.id)
+                diagnostic = issue(code)
+                self.store.note_request(unit.id, diagnostic=diagnostic)
+                safe = DeliveryError(code, retryable=code == "unavailable" and not manual)
+                if occ:
+                    self._fail_occurrence(item, occ, safe)
+                else:
+                    self._fail(item, safe)
+                return True
+            if not self.store.begin_send(unit.id, now):
+                return False
+            self._enter_send(item.id, req["request_id"])
+            try:
+                frozen = req["frozen"]
+                method = getattr(adapter, "deliver_frozen", None)
+                if callable(method):
+                    sent = method(frozen)
+                else:
+                    body = json.loads(frozen["body"])
+                    sent = adapter.deliver(frozen["target"], body["text"], urgent=frozen["urgent"],
+                                                admission_id=req["request_id"])
+                if (sent.admission_id or sent.inbox_id) != req["request_id"]:
+                    raise DeliveryError("conflict")
+                facts = sent.raw.get("facts", {"admitted": True, "consumed": sent.consumed})
+                self.store.note_request(unit.id, facts=facts,
+                                        phase="consumed" if sent.consumed else "admitted")
+                if self.store.get(item.id).status == "cancelled":
+                    self._retract_stopped(item, occ)
+                elif sent.consumed:
+                    self._consume(item, occ, req["request_id"], sent.delivery)
+                elif sent.state == "failed":
+                    self._provider_failed(item, occ)
+                elif facts.get("admitted") and sent.state != "uncertain":
+                    self._note_admitted(item, occ, req["request_id"], sent.delivery)
+                else:
+                    self.store.note_request(unit.id, diagnostic=issue("acceptance_unknown", phase="send", certainty="unknown"))
+                    self._ambiguous(item, occ, req["request_id"], issue("acceptance_unknown")["detail"])
+            except Exception as exc:
+                code = exc.code if isinstance(exc, DeliveryError) and exc.code == "conflict" else "acceptance_unknown"
+                self.store.note_request(unit.id, diagnostic=issue(code, phase="send", certainty="unknown"))
+                self._ambiguous(item, occ, req["request_id"], issue(code)["detail"])
+            finally:
+                self._leave_send(item.id)
+            return True
+        finally:
+            gate.release()
+
+    def _provider_failed(self, item, occ=None):
+        """A documented terminal pre-claim receipt, not authority to resend."""
+        unit = occ or item
+        req = self.store.get_request(unit.id)
+        if any(req["facts"].get(k) for k in ("claimed", "injected", "consumed")):
+            return False  # Never downgrade stronger historical facts.
+        self.store.note_request(unit.id, facts={"failed_before_claim": True}, phase="failed",
+                                diagnostic=issue("provider_failed", phase="status",
+                                                 certainty="admitted" if req["facts"].get("admitted") else "unknown"))
+        fresh = self.store.get_occurrence(unit.id) if occ else self.store.get(unit.id)
+        if fresh.status == "cancelled":
+            return True
+        fresh.status = "undeliverable"
+        fresh.updated_at = self.clock.now()
+        fresh.next_attempt_at = None
+        fresh.error = "provider_failed: " + issue("provider_failed")["detail"]
+        fresh.receipt = {"admission_id": req["request_id"], "state": "failed",
+                         "delivery": json.loads(req["frozen"]["body"])["delivery"]}
+        allowed = ("firing", "pending", "admitted", "ambiguous")
+        saved = self.store.cas_occurrence(fresh, allowed) if occ else self.store.cas_item(fresh, allowed)
+        if saved and occ:
+            self._after_occurrence(item, fresh, self.clock.now())
+        return saved
 
     def tick(self) -> list[str]:
         now = self.clock.now()
         touched: list[str] = []
+        for req in self.store.stopped_unresolved_requests():
+            parent = self.store.get(req["item_id"])
+            occ = self.store.get_occurrence(req["occurrence_id"]) if req["occurrence_id"] else None
+            if parent and self._reconcile_unit(parent, occ):
+                touched.append(req["unit_id"])
         for item in self.store.list_outstanding():
             if item.status in ("admitted", "ambiguous"):
                 if self._reconcile_item(item):
@@ -184,125 +542,61 @@ class Scheduler:
 
     def _reclaim(self, item_id: str, now) -> bool:
         item = self.store.get(item_id)
-        if item is None or item.status != "firing":
+        return self._reclaim_unit(item, None, now) if item else False
+
+    def _reclaim_unit(self, item, occ, now):
+        unit = occ or item
+        gate = self._gate(item.id)
+        if not gate.acquire(blocking=False):
             return False
-        state = (item.receipt or {}).get("state")
-        aid = (item.receipt or {}).get("admission_id")
-        item.updated_at = now
-        if state == "consumed":
-            item.status = "delivered"
-            item.delivered_at = item.delivered_at or now
-            item.error = None
-            self.store.cas_item(item, ("firing",))
-            return True
-        if state == "admitted" and aid:
-            item.status = "admitted"
-            item.error = None
-            self.store.cas_item(item, ("firing",))
-            return True
-        if not aid:
-            item.status = "ambiguous"
-            item.error = "ambiguous: firing claim had no stable admission id"
-            item.next_attempt_at = None
-            self.store.cas_item(item, ("firing",))
-            _log(f"ambiguous {item.id} no admission id")
-            return True
-        item.status = "pending"
-        item.next_attempt_at = now
-        self.store.cas_item(item, ("firing",))
-        return True
+        try:
+            req = self.store.reserve_request(item, occ)
+            if req["facts"].get("consumed"):
+                return self._consume(item, occ, req["request_id"], None)
+            code = retry_refusal(req)
+            spent_claim = (req["dispatch_state"] == "never" and not any(req["facts"].values())
+                           and not req["manual_pending"]
+                           and (req["manual_used"] or unit.attempts >= MAX_ATTEMPTS))
+            if spent_claim:
+                # A committed manual claim spends that single attempt, even if the
+                # process dies before preflight. Close it truthfully, never strand
+                # it pending or restore authorization/counters after restart. The
+                # last automatic claim has the same terminal boundary.
+                code = "retry_budget" if req["manual_used"] else "attempt_budget"
+                self.store.note_request(unit.id, diagnostic=issue(code, phase="restart"))
+                error = DeliveryError(code)
+                if occ:
+                    self._fail_occurrence(item, occ, error)
+                else:
+                    self._fail(item, error)
+                return True
+            if req["dispatch_state"] == "possible" or code:
+                code = code or "acceptance_unknown"
+                self.store.note_request(unit.id, diagnostic=issue(code, phase="restart", certainty="unknown"))
+                return self._ambiguous(item, occ, req["request_id"], issue(code)["detail"])
+            unit.status = "pending"
+            unit.next_attempt_at = now
+            unit.updated_at = now
+            if occ:
+                changed = self.store.cas_occurrence(unit, ("firing",))
+                item.next_attempt_at = now
+                self.store.cas_item(item, ("pending",))
+                return changed
+            return self.store.cas_item(unit, ("firing",))
+        finally:
+            gate.release()
+
 
     def _reclaim_occurrence(self, occ_id: str, now) -> bool:
         occ = self.store.get_occurrence(occ_id)
-        if occ is None or occ.status != "firing":
-            return False
-        state = (occ.receipt or {}).get("state")
-        aid = (occ.receipt or {}).get("admission_id")
-        occ.updated_at = now
-        parent = self.store.get(occ.item_id)
-        if state == "consumed":
-            occ.status = "delivered"
-            occ.delivered_at = occ.delivered_at or now
-            occ.error = None
-            if self.store.cas_occurrence(occ, ("firing",)) and parent is not None:
-                self._after_occurrence(parent, occ, now)
-            return True
-        if state == "admitted" and aid:
-            occ.status = "admitted"
-            occ.error = None
-            self.store.cas_occurrence(occ, ("firing",))
-            self._hold_parent(parent, now, occ)
-            return True
-        if not aid:
-            occ.status = "ambiguous"
-            occ.error = "ambiguous: firing claim had no stable admission id"
-            occ.next_attempt_at = None
-            self.store.cas_occurrence(occ, ("firing",))
-            self._hold_parent(parent, now, occ)
-            _log(f"ambiguous {occ.id} no admission id")
-            return True
-        occ.status = "pending"
-        occ.next_attempt_at = now
-        self.store.cas_occurrence(occ, ("firing",))
-        if parent is not None and parent.status == "pending":
-            parent.next_attempt_at = now
-            parent.updated_at = now
-            self.store.cas_item(parent, ("pending",))
-        return True
+        parent = self.store.get(occ.item_id) if occ else None
+        return self._reclaim_unit(parent, occ, now) if parent else False
+
 
     def _fire(self, item_id: str) -> bool:
-        now = self.clock.now()
-        if not self.store.claim(item_id, now):
-            return False
         item = self.store.get(item_id)
-        if item is None or item.status != "firing":
-            return False
-        aid = self._ensure_item_id(item)
-        if aid is None:
-            return False
-        item = self.store.get(item_id) or item
-        decision = self._decide(item, None, aid)
-        if decision != "send":
-            return True
-        try:
-            check = self.adapter.validate(item.target)
-        except DeliveryError as exc:
-            self._fail(item, exc)
-            return True
-        if not check.ok:
-            if check.code == "unavailable":
-                self._fail(item, DeliveryError(check.code, check.detail, retryable=True))
-            else:
-                self._undeliverable(item, check.code, check.detail)
-            return True
-        if not self._mark_sending_item(item, aid):
-            return False
-        self._enter_send(item.id, aid)
-        try:
-            late = is_late(item.fire_at, now)
-            text = wake_text(
-                kind=item.kind,
-                item_id=item.id,
-                reason=item.reason,
-                fire_at=item.fire_at,
-                now=now,
-                late=late,
-                urgent=item.urgent,
-                created_by=item.created_by,
-                context=item.context,
-            )
-            try:
-                sent = self.adapter.deliver(item.target, text, urgent=item.urgent, admission_id=aid)
-            except DeliveryError as exc:
-                if exc.code == "conflict":
-                    return self._conflict_item(item, aid)
-                self._fail(item, exc)
-                return True
-            item.late = late
-            item.late_by_seconds = late_by_seconds(item.fire_at, now) if late else None
-            return self._after_send_item(item, sent)
-        finally:
-            self._leave_send(item.id)
+        return self._deliver_unit(item) if item else False
+
 
     def _fire_recurring(self, item) -> bool:
         now = self.clock.now()
@@ -311,11 +605,7 @@ class Scheduler:
         if occ_id:
             occ = self.store.get_occurrence(occ_id)
             if occ is None:
-                spec["open_occurrence_id"] = None
-                item.spec = spec
-                item.updated_at = now
-                self.store.cas_item(item, ("pending", "firing"))
-                return True
+                return self._ambiguous(item, None, None, issue("legacy_identity_unknown")["detail"])
             if occ.status in ("delivered", "undeliverable"):
                 return self._advance_recurring(item, occ, now)
             if occ.status == "cancelled":
@@ -403,7 +693,9 @@ class Scheduler:
             return True
         item.status = "pending"
         item.fire_at = nxt
-        item.error = outcome.detail or None
+        # An unmet condition is normal waiting, not a delivery validation error.
+        # Keep unavailable checks visible; delivery validation happens after latch.
+        item.error = None if outcome.kind == "waiting" else outcome.detail or None
         item.next_attempt_at = None
         self.store.cas_item(item, ("pending",))
         return True
@@ -440,12 +732,7 @@ class Scheduler:
     def _deliver_latched(self, item) -> bool:
         occ = self.store.open_occurrence(item)
         if occ is None:
-            spec = dict(item.spec or {})
-            spec["open_occurrence_id"] = None
-            item.spec = spec
-            item.updated_at = self.clock.now()
-            self.store.cas_item(item, ("pending", "firing"))
-            return True
+            return self._ambiguous(item, None, None, issue("legacy_identity_unknown")["detail"])
         if occ.status in ("delivered", "undeliverable"):
             return self._after_occurrence(item, occ, self.clock.now())
         if occ.status in ("admitted", "ambiguous"):
@@ -458,298 +745,20 @@ class Scheduler:
         return self._deliver_occurrence(item, occ)
 
     def _deliver_occurrence(self, item, occ) -> bool:
-        now = self.clock.now()
-        if item.status == "cancelled" or occ.status == "cancelled":
-            return False
-        if occ.status == "pending":
-            if not self.store.claim_occurrence(occ.id, now):
-                return False
-            occ = self.store.get_occurrence(occ.id)
-        elif occ.status == "firing" and self._lease_fresh(occ.firing_at, now):
-            return False
-        elif occ.status != "firing":
-            return self._after_occurrence(item, occ, now)
-        if occ is None:
-            return False
-        aid = self._ensure_occ_id(item, occ)
-        if aid is None:
-            return False
-        occ = self.store.get_occurrence(occ.id) or occ
-        item = self.store.get(item.id) or item
-        if self._decide(item, occ, aid) != "send":
-            return True
-        try:
-            check = self.adapter.validate(item.target)
-        except DeliveryError as exc:
-            self._fail_occurrence(item, occ, exc)
-            return True
-        if not check.ok:
-            retryable = check.code == "unavailable"
-            self._fail_occurrence(
-                item, occ, DeliveryError(check.code, check.detail, retryable=retryable),
-            )
-            return True
-        if not self._mark_sending_occ(occ, aid):
-            return False
-        self._enter_send(item.id, aid)
-        try:
-            plan = self._plan(item, occ, now)
-            late = is_late(occ.scheduled_at, now)
-            text = wake_text(
-                kind=item.kind,
-                item_id=item.id,
-                reason=item.reason,
-                fire_at=occ.scheduled_at,
-                now=now,
-                late=late,
-                urgent=item.urgent,
-                created_by=item.created_by,
-                context=item.context,
-                occurrence_id=occ.id,
-                coalesced=plan["coalesced"],
-                check=(item.spec or {}).get("check"),
-                summary=(occ.detail or {}).get("summary") or (item.spec or {}).get("summary"),
-                next_fire=plan["next_fire"],
-                remaining=plan["remaining"],
-                series_continues=plan["continues"],
-                previous_undeliverable=plan["previous"],
-            )
-            try:
-                sent = self.adapter.deliver(item.target, text, urgent=item.urgent, admission_id=aid)
-            except DeliveryError as exc:
-                if exc.code == "conflict":
-                    return self._conflict_occurrence(item, occ, aid)
-                self._fail_occurrence(item, occ, exc)
-                return True
-            return self._after_send_occurrence(item, occ, sent, now)
-        finally:
-            self._leave_send(item.id)
-
-    def _ensure_item_id(self, item) -> str | None:
-        aid = (item.receipt or {}).get("admission_id")
-        if aid:
-            return aid
-        aid = new_admission_id()
-        item.receipt = {"admission_id": aid, "state": "prepared"}
-        item.updated_at = self.clock.now()
-        if not self.store.cas_item(item, ("firing",)):
-            return None
-        return aid
-
-    def _ensure_occ_id(self, item, occ) -> str | None:
-        aid = (occ.receipt or {}).get("admission_id")
-        if aid:
-            return aid
-        aid = new_admission_id()
-        occ.receipt = {"admission_id": aid, "state": "prepared"}
-        occ.updated_at = self.clock.now()
-        if not self.store.cas_occurrence(occ, ("firing",)):
-            return None
-        return aid
-
-    def _mark_sending_item(self, item, aid: str) -> bool:
-        fresh = self.store.get(item.id) or item
-        if fresh.status != "firing":
-            return False
-        receipt = dict(fresh.receipt or {})
-        receipt["admission_id"] = aid
-        receipt["state"] = "sending"
-        fresh.receipt = receipt
-        fresh.updated_at = self.clock.now()
-        return self.store.cas_item(fresh, ("firing",))
-
-    def _mark_sending_occ(self, occ, aid: str) -> bool:
-        fresh = self.store.get_occurrence(occ.id) or occ
-        if fresh.status != "firing":
-            return False
-        receipt = dict(fresh.receipt or {})
-        receipt["admission_id"] = aid
-        receipt["state"] = "sending"
-        fresh.receipt = receipt
-        fresh.updated_at = self.clock.now()
-        return self.store.cas_occurrence(fresh, ("firing",))
-
-    def _decide(self, item, occ, aid: str) -> str:
-        """Return send, or handle an existing id and return wait.
-
-        A confirmed admission is never posted again. A missing unconfirmed id
-        may be posted: the host returns the original admission if it landed.
-        """
-        receipt = (occ.receipt if occ is not None else item.receipt) or {}
-        state = receipt.get("state")
-        if state == "admitted":
-            if occ is not None:
-                self._reconcile_occurrence(item, occ)
-            else:
-                self._reconcile_item(item)
-            return "wait"
-        if state == "ambiguous":
-            if occ is not None:
-                self._reconcile_occurrence(item, occ)
-            else:
-                self._reconcile_item(item)
-            return "wait"
-        if state == "consumed":
-            self._consume(item, occ, aid, receipt.get("delivery"))
-            return "wait"
-        found = self._lookup(item, occ, aid)
-        if found == "stop":
-            return "wait"
-        if found == "consumed":
-            self._consume(item, occ, aid, receipt.get("delivery"))
-            return "wait"
-        if found == "admitted":
-            self._note_admitted(item, occ, aid, receipt.get("delivery"))
-            return "wait"
-        if found == "unavailable":
-            return "wait"
-        return "send"
-
-    def _lookup(self, item, occ, aid: str) -> str:
-        try:
-            return self.adapter.reconcile(item.target, aid)
-        except DeliveryError as exc:
-            if occ is not None:
-                self._fail_occurrence(item, occ, exc)
-            else:
-                self._fail(item, exc)
-            return "stop"
-        except Exception as exc:
-            log_scheduler_error(exc)
-            held = occ or item
-            held.error = _short(exc)
-            held.updated_at = self.clock.now()
-            if occ is not None:
-                self.store.cas_occurrence(occ, OPEN)
-            else:
-                self.store.cas_item(item, OPEN)
-            return "unavailable"
-
-    def _after_send_item(self, item, sent) -> bool:
-        current = self.store.get(item.id)
-        aid = sent.admission_id or sent.inbox_id
-        if current is not None and current.status == "cancelled":
-            self._retract_cancelled(item, aid)
-            return True
-        if sent.consumed:
-            return self._consume(item, None, aid, sent.delivery)
-        found = self._lookup_quiet(item.target, aid)
-        if found == "consumed":
-            return self._consume(item, None, aid, sent.delivery)
-        # A 200 is admission even if the inbox row is not visible yet.
-        return self._note_admitted(item, None, aid, sent.delivery)
-
-    def _after_send_occurrence(self, item, occ, sent, now) -> bool:
-        current = self.store.get(item.id)
-        aid = sent.admission_id or sent.inbox_id
-        if current is not None and current.status == "cancelled":
-            self._retract_cancelled(item, aid)
-            self._cancel_occurrence(occ, self.clock.now())
-            return True
-        if sent.consumed:
-            return self._consume(item, occ, aid, sent.delivery, now=now)
-        found = self._lookup_quiet(item.target, aid)
-        if found == "consumed":
-            return self._consume(item, occ, aid, sent.delivery, now=now)
-        return self._note_admitted(item, occ, aid, sent.delivery)
-
-    def _retract_cancelled(self, item, aid: str | None) -> None:
-        """Drop a host prompt after cancel won the race. Record a failed drop.
-
-        A missing id was either retracted or never accepted. A consumed or
-        still-held id is written onto the cancelled row so a later reader
-        does not treat the removal as clean. This does not admit again.
-        """
-        if not aid or not item.target:
-            return
-        outcome = retract_admission(
-            self.adapter, item.target, aid, confirmed=False,
-        )
-        if outcome == FAILED:
-            self._note_cancel_truth(
-                item, aid, FAILED, "retraction failed: the host still holds this admission",
-            )
-        elif outcome == AMBIGUOUS:
-            self._note_cancel_truth(
-                item, aid, AMBIGUOUS, "retraction uncertain: the host could not be checked after cancel",
-            )
-        elif outcome == CONSUMED:
-            self._note_cancel_truth(
-                item, aid, CONSUMED, "not removed: the host already consumed this admission",
-            )
-
-    def _note_cancel_truth(self, item, aid: str, state: str, error: str) -> None:
-        fresh = self.store.get(item.id)
-        if fresh is None or fresh.status != "cancelled":
-            return
-        receipt = dict(fresh.receipt or {})
-        receipt["admission_id"] = aid
-        receipt["state"] = state
-        fresh.receipt = receipt
-        fresh.error = error
-        fresh.updated_at = self.clock.now()
-        self.store.cas_item(fresh, ("cancelled",))
+        return self._deliver_unit(item, occ)
 
     def _lookup_quiet(self, target, aid: str) -> str:
         try:
-            return self.adapter.reconcile(target, aid)
+            return self.adapter_for_target(target).reconcile(target, aid)
         except Exception as exc:
             log_scheduler_error(exc)
-            return "admitted"
-
-    def _conflict_item(self, item, aid: str) -> bool:
-        found = self._lookup_quiet(item.target, aid)
-        if found == "consumed":
-            return self._consume(item, None, aid, (item.receipt or {}).get("delivery"))
-        if found == "admitted":
-            return self._note_admitted(item, None, aid, (item.receipt or {}).get("delivery"))
-        return self._ambiguous(item, None, aid, "host reported a conflict and the admission id was not found")
-
-    def _conflict_occurrence(self, item, occ, aid: str) -> bool:
-        found = self._lookup_quiet(item.target, aid)
-        if found == "consumed":
-            return self._consume(item, occ, aid, (occ.receipt or {}).get("delivery"))
-        if found == "admitted":
-            return self._note_admitted(item, occ, aid, (occ.receipt or {}).get("delivery"))
-        return self._ambiguous(item, occ, aid, "host reported a conflict and the admission id was not found")
+            return "unavailable"
 
     def _reconcile_item(self, item) -> bool:
-        aid = (item.receipt or {}).get("admission_id")
-        if not aid:
-            return False
-        if item.status == "ambiguous":
-            found = self._lookup_quiet(item.target, aid)
-            if found == "consumed":
-                return self._consume(item, None, aid, (item.receipt or {}).get("delivery"))
-            if found == "admitted":
-                return self._note_admitted(item, None, aid, (item.receipt or {}).get("delivery"))
-            return False
-        found = self._lookup_quiet(item.target, aid)
-        if found == "consumed":
-            return self._consume(item, None, aid, (item.receipt or {}).get("delivery"))
-        if found in ("admitted", "unavailable"):
-            return False
-        return self._lose(item, None, aid)
+        return self._reconcile_unit(item)
 
     def _reconcile_occurrence(self, item, occ) -> bool:
-        aid = (occ.receipt or {}).get("admission_id")
-        if not aid:
-            return False
-        if occ.status == "ambiguous":
-            found = self._lookup_quiet(item.target, aid)
-            if found == "consumed":
-                return self._consume(item, occ, aid, (occ.receipt or {}).get("delivery"))
-            if found == "admitted":
-                return self._note_admitted(item, occ, aid, (occ.receipt or {}).get("delivery"))
-            self._hold_parent(item, self.clock.now(), occ)
-            return False
-        found = self._lookup_quiet(item.target, aid)
-        if found == "consumed":
-            return self._consume(item, occ, aid, (occ.receipt or {}).get("delivery"))
-        if found in ("admitted", "unavailable"):
-            self._hold_parent(item, self.clock.now(), occ)
-            return False
-        return self._lose(item, occ, aid)
+        return self._reconcile_unit(item, occ)
 
     def _note_admitted(self, item, occ, aid: str, delivery: str | None) -> bool:
         now = self.clock.now()
@@ -759,13 +768,13 @@ class Scheduler:
             "delivery": delivery,
             "state": "admitted",
         }
-        host_status = getattr(self.adapter, "host_status", None)
+        host_status = getattr(self.adapter_for_target(item.target), "host_status", None)
         if callable(host_status):
             receipt["host"] = host_status()
         if occ is None:
             fresh = self.store.get(item.id) or item
             if fresh.status == "cancelled":
-                self.adapter.cancel_admission(item.target, aid)
+                self._retract_stopped(item, None)
                 return True
             fresh.status = "admitted"
             fresh.updated_at = now
@@ -776,13 +785,13 @@ class Scheduler:
             fresh.late = item.late
             fresh.late_by_seconds = item.late_by_seconds
             if not self.store.cas_item(fresh, ("firing", "admitted", "pending", "ambiguous")):
-                self.adapter.cancel_admission(item.target, aid)
+                self._retract_stopped(item, None)
                 return True
             _log(f"admitted {fresh.id} {delivery or 'queue'}")
             return True
         occ = self.store.get_occurrence(occ.id) or occ
         if occ.status == "cancelled":
-            self.adapter.cancel_admission(item.target, aid)
+            self._retract_stopped(item, occ)
             return True
         occ.status = "admitted"
         occ.updated_at = now
@@ -791,7 +800,7 @@ class Scheduler:
         occ.delivered_at = None
         occ.receipt = receipt
         if not self.store.cas_occurrence(occ, ("firing", "admitted", "pending", "ambiguous")):
-            self.adapter.cancel_admission(item.target, aid)
+            self._retract_stopped(item, occ)
             return True
         parent = self.store.get(item.id) or item
         self._hold_parent(parent, now, occ)
@@ -806,7 +815,7 @@ class Scheduler:
             "delivery": delivery,
             "state": "consumed",
         }
-        host_status = getattr(self.adapter, "host_status", None)
+        host_status = getattr(self.adapter_for_target(item.target), "host_status", None)
         if callable(host_status):
             receipt["host"] = host_status()
         if occ is None:
@@ -849,37 +858,6 @@ class Scheduler:
         fresh = self.store.get(item.id) or item
         return self._after_occurrence(fresh, occ, self.clock.now())
 
-    def _lose(self, item, occ, aid: str) -> bool:
-        detail = "admitted prompt is neither in the inbox nor in the transcript"
-        if occ is None:
-            fresh = self.store.get(item.id) or item
-            if fresh.status == "cancelled":
-                return True
-            fresh.status = "undeliverable"
-            fresh.updated_at = self.clock.now()
-            fresh.error = f"lost: {detail}"
-            fresh.next_attempt_at = None
-            receipt = dict(fresh.receipt or {})
-            receipt["admission_id"] = aid
-            receipt["state"] = "lost"
-            fresh.receipt = receipt
-            self.store.cas_item(fresh, ("admitted", "firing", "ambiguous"))
-            _log(f"undeliverable {fresh.id} {fresh.error}")
-            return True
-        occ = self.store.get_occurrence(occ.id) or occ
-        occ.status = "undeliverable"
-        occ.updated_at = self.clock.now()
-        occ.error = f"lost: {detail}"
-        occ.next_attempt_at = None
-        receipt = dict(occ.receipt or {})
-        receipt["admission_id"] = aid
-        receipt["state"] = "lost"
-        occ.receipt = receipt
-        if not self.store.cas_occurrence(occ, ("admitted", "firing", "ambiguous")):
-            return False
-        _log(f"undeliverable {occ.id} {occ.error}")
-        fresh = self.store.get(item.id) or item
-        return self._after_occurrence(fresh, occ, self.clock.now())
 
     def _ambiguous(self, item, occ, aid: str, detail: str) -> bool:
         now = self.clock.now()
@@ -919,15 +897,6 @@ class Scheduler:
             self.store.cas_item(parent, ("firing",))
         else:
             self.store.cas_item(parent, ("pending",))
-
-    def _finish_occurrence(self, item, occ, now, *, receipt: dict) -> None:
-        """Compatibility for tests that still call the old completion helper."""
-        aid = (receipt or {}).get("admission_id") or (receipt or {}).get("inbox_id") or "msg_recovered"
-        delivery = (receipt or {}).get("delivery")
-        if (receipt or {}).get("state") == "admitted":
-            self._note_admitted(item, occ, aid, delivery)
-            return
-        self._consume(item, occ, aid, delivery, now=now)
 
     def _fail_occurrence(self, item, occ, exc: DeliveryError) -> None:
         now = self.clock.now()
@@ -1048,7 +1017,8 @@ class Scheduler:
         previous = self.store.previous_occurrence(item.id, occ.seq)
         previous_text = None
         if previous is not None and previous.status == "undeliverable":
-            previous_text = f"{previous.id} ({previous.error or 'undeliverable'})"
+            code = (previous.error or "").partition(":")[0]
+            previous_text = f"{previous.id} ({issue(code)['detail']})"
         if item.kind != "recurring":
             return {
                 "coalesced": 0,
@@ -1093,13 +1063,6 @@ class Scheduler:
         occ.updated_at = now
         occ.next_attempt_at = None
         self.store.cas_occurrence(occ, OPEN)
-
-    def _finish_delivered(self, item, now, *, receipt: dict) -> None:
-        aid = (receipt or {}).get("admission_id") or (receipt or {}).get("inbox_id") or "msg_recovered"
-        if (receipt or {}).get("state") == "admitted":
-            self._note_admitted(item, None, aid, (receipt or {}).get("delivery"))
-            return
-        self._consume(item, None, aid, (receipt or {}).get("delivery"), now=now)
 
     def _undeliverable(self, item, code: str, detail: str) -> None:
         now = self.clock.now()
@@ -1161,8 +1124,7 @@ class Scheduler:
 
 def log_scheduler_error(exc: BaseException) -> None:
     """Log a scheduler failure without a credential or a request body."""
-    text = scrub(f"{type(exc).__name__}: {exc}")
-    _log("scheduler error: " + text[:300])
+    _log("scheduler error: delivery operation failed; check delivery status")
 
 
 def _needs_check(item) -> bool:
@@ -1190,8 +1152,7 @@ def _parse(value: str | None) -> datetime | None:
 
 
 def _short(exc: Exception) -> str:
-    text = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
-    return text[:180]
+    return issue("unavailable")["detail"]
 
 
 def _log(message: str) -> None:

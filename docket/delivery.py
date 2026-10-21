@@ -9,8 +9,9 @@ A caller-supplied ``msg_`` id is the stable admission. Probed against the
 local OpenCode server (2.0.23): a retry of the same id returns the original
 admission and does not change its text or add a second inbox item. After the
 inbox item is cancelled, that id can be admitted again, so a confirmed
-admission that later vanishes is not retried. Consumption is a message lookup
-by that id, not a scan of the last twenty messages.
+admission that later vanishes is not retried. The recovery core requires a saved
+user message with that id and exact frozen text, not an id-only lookup or a scan
+of recent messages.
 
 Cancellation drops that same id. A receipt can persist the id with state
 ``sending`` before ``inbox_id`` is saved. The id is still the inbox key.
@@ -35,11 +36,20 @@ from urllib.parse import urlsplit
 
 
 class DeliveryError(Exception):
-    def __init__(self, code: str, detail: str, *, retryable: bool = False):
-        super().__init__(detail)
-        self.code = code
-        self.detail = detail
+    def __init__(self, code: str, detail: str = "", *, retryable: bool = False,
+                 not_dispatched: bool = False):
+        from docket.delivery_state import issue
+        safe = issue(code)["detail"]
+        super().__init__(safe)
+        self.code = issue(code)["code"]
+        self.detail = safe
         self.retryable = retryable
+        self.not_dispatched = not_dispatched
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
 
 
 @dataclass
@@ -54,7 +64,9 @@ class Validation:
 
     @classmethod
     def bad(cls, code: str, detail: str) -> "Validation":
-        return cls(False, code, detail)
+        from docket.delivery_state import issue
+        diagnostic = issue(code)
+        return cls(False, diagnostic["code"], diagnostic["detail"])
 
 
 @dataclass
@@ -129,7 +141,10 @@ def _delete_admission(adapter, target: dict, admission_id: str) -> None:
 class DeliveryAdapter:
     name = "base"
 
-    def validate(self, target: dict) -> Validation:
+    def validate_frozen(self, frozen: dict) -> Validation:
+        return self.validate(frozen["target"], expected_binding=frozen["binding"])
+
+    def validate(self, target: dict, *, expected_binding=None) -> Validation:
         raise NotImplementedError
 
     def reconcile(self, target: dict, admission_id: str) -> str:
@@ -155,10 +170,64 @@ class OpenCodeAdapter(DeliveryAdapter):
         self.archive = archive
         self.calls: list[str] = []
 
-    def validate(self, target: dict) -> Validation:
+    def binding_snapshot(self) -> dict:
+        base, _auth = self._discovery()
+        return {"adapter": self.name, "mode": "generic-opencode",
+                "origin": _opencode_origin(base), "namespace_verified": False}
+
+    def deliver_frozen(self, frozen: dict) -> Receipt:
+        body = json.loads(frozen["body"])
+        status, response = self._request(
+            "POST", f"/api/session/{frozen['target']['session_id']}/prompt", body,
+            expected_binding=frozen["binding"],
+        )
+        # Any result after dispatch is potentially accepted, including malformed JSON,
+        # conflicts and 5xx. The scheduler never replays it on this host contract.
+        if status != 200:
+            raise DeliveryError("conflict" if status == 409 else "unavailable")
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, dict) or data.get("id") != body["id"]:
+            raise DeliveryError("acceptance_unknown")
+        return Receipt(body["id"], body["delivery"], admission_id=body["id"])
+
+    def status_frozen(self, frozen: dict) -> str:
+        """Only exact saved user text is consumption evidence, never an ID alone."""
+        body = json.loads(frozen["body"])
+        target = frozen["target"]
+        status, response = self._request(
+            "GET", f"/api/session/{target['session_id']}/message/{body['id']}",
+            expected_binding=frozen["binding"],
+        )
+        if status == 200:
+            data = response.get("data") if isinstance(response, dict) else None
+            if (isinstance(data, dict) and data.get("id") == body["id"]
+                    and data.get("type") == "user" and data.get("text") == body["text"]):
+                # Released 2.0.32 saved user message: {id, time, text, type}.
+                # Session identity is the exact bound route, not an invented field.
+                return "consumed"
+            # Unknown/weak transcript shape must not be upgraded to delivery proof.
+            raise DeliveryError("acceptance_unknown")
+        if status != 404:
+            raise DeliveryError("unavailable")
+        status, response = self._request(
+            "GET", f"/api/session/{target['session_id']}/inbox", expected_binding=frozen["binding"],
+        )
+        items = response.get("data") if isinstance(response, dict) else None
+        if status != 200 or not isinstance(items, list):
+            raise DeliveryError("unavailable")
+        if any(isinstance(item, dict) and item.get("id") == body["id"] for item in items):
+            return "admitted"
+        return "missing"
+
+    def cancel_frozen(self, frozen: dict) -> None:
+        body = json.loads(frozen["body"])
+        self._request("DELETE", f"/api/session/{frozen['target']['session_id']}/inbox/{body['id']}",
+                      expected_binding=frozen["binding"])
+
+    def validate(self, target: dict, *, expected_binding=None) -> Validation:
         session_id = target.get("session_id") or ""
         try:
-            status, body = self._request("GET", f"/api/session/{session_id}")
+            status, body = self._request("GET", f"/api/session/{session_id}", expected_binding=expected_binding)
         except DeliveryError as exc:
             if exc.retryable:
                 return Validation.bad("unavailable", exc.detail)
@@ -179,7 +248,14 @@ class OpenCodeAdapter(DeliveryAdapter):
         expected = target.get("directory")
         if expected:
             actual = ((data.get("location") or {}).get("directory")) or ""
-            if not _same_dir(expected, actual):
+            try:
+                same = _same_dir(expected, actual)
+            except OSError:
+                return Validation.bad(
+                    "unavailable",
+                    "session directory identity could not be verified",
+                )
+            if not same:
                 return Validation.bad(
                     "wrong_target",
                     "session is not in the directory this item was set for",
@@ -320,15 +396,20 @@ class OpenCodeAdapter(DeliveryAdapter):
         except DeliveryError:
             return
 
-    def _request(self, method: str, path: str, body: dict | None = None):
+    def _request(self, method: str, path: str, body: dict | None = None, *, expected_binding=None):
         base, auth = self._discovery()
         # Validate even injected discovery; neither runtime requests nor metadata use raw bases.
         self._host_origin = None
         base = _opencode_origin(base)
+        if expected_binding is not None and expected_binding != {
+            "adapter": self.name, "mode": "generic-opencode", "origin": base,
+            "namespace_verified": False,
+        }:
+            raise DeliveryError("backend_unverifiable", not_dispatched=True)
         self._host_origin = base
         self.calls.append(f"{method} {path}")
         url = base.rstrip("/") + path
-        data = None if body is None else json.dumps(body).encode()
+        data = None if body is None else json.dumps(body, sort_keys=True).encode()
         request = urllib.request.Request(
             url,
             data=data,
@@ -340,7 +421,9 @@ class OpenCodeAdapter(DeliveryAdapter):
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            # A prepared binding must not be redirected or routed through an ambient proxy.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+            with opener.open(request, timeout=self.timeout) as response:
                 raw = response.read()
                 parsed = json.loads(raw) if raw else None
                 return response.status, parsed
@@ -432,12 +515,8 @@ def _opencode_origin(url: str) -> str:
 
 
 def _same_dir(expected: str, actual: str) -> bool:
-    if not actual:
-        return False
-    try:
-        return os.path.realpath(expected) == os.path.realpath(actual)
-    except OSError:
-        return expected == actual
+    from docket.platform import same_directory
+    return same_directory(expected, actual)
 
 
 def _contains(value, marker: str) -> bool:

@@ -38,7 +38,18 @@ def _install_plist() -> bytes:
     mode = os.environ.get("DOCKET_DELIVERY_HOST", "auto")
     if mode not in ("auto", "opencode", "openchamber-paired", "openchamber-unpaired"):
         raise ValueError("unsupported DOCKET_DELIVERY_HOST")
-    state = home().resolve()
+    selected = Path(raw).expanduser()
+    if selected.is_symlink() and "DOCKET_HOME" in os.environ and Path(raw).is_absolute():
+        # Shipped Mac install compatibility only: validate the existing canonical
+        # target without relaxing store.home() or repairing its permissions.
+        from docket.platform import private_directory
+
+        state = selected.resolve(strict=True)
+        if not state.is_dir():
+            raise ValueError("unsupported DOCKET_HOME alias")
+        private_directory(state)
+    else:
+        state = home().resolve()
     path = os.environ.get("PATH", "")
     for extra in (str(Path.home() / ".local/bin"), "/opt/homebrew/bin",
                   "/usr/local/bin", "/usr/bin", "/bin"):
@@ -57,6 +68,16 @@ def _install_plist() -> bytes:
 
 
 def run(action: str) -> int:
+    if sys.platform == "win32":
+        from docket.service_windows import run as windows_run
+
+        return windows_run(action)
+    if sys.platform == "linux":
+        from docket.service_linux import run as run_linux
+        return run_linux(action)
+    if sys.platform != "darwin":
+        print("docket service: native service backend not implemented on this platform")
+        return 1
     if action == "install":
         try:
             data = _install_plist()

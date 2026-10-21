@@ -27,6 +27,14 @@ from datetime import datetime
 from pathlib import Path
 
 from docket.client import ClientError
+from docket.platform import (
+    PrivateStorageError,
+    create_private_file,
+    private_directory,
+    read_private_bytes,
+    replace_private_bytes,
+    state_root,
+)
 
 MAX_BYTES = 65536
 
@@ -45,27 +53,22 @@ def fail(detail="invalid Connection link"):
 
 def state_dir() -> Path:
     # Deliberately separate from the daemon database and inbound API token.
-    return Path(os.environ.get("DOCKET_HOME", "~/.docket")).expanduser() / "openchamber"
+    return state_root() / "openchamber"
 
 
 def private_dir(root: Path) -> None:
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    st = root.lstat()
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
-        fail("Docket client directory must be owned by this user, mode 0700, and not a symlink")
+    try:
+        private_directory(root)
+    except OSError as exc:
+        fail(str(exc))
 
 
 def read_private(path: Path) -> dict:
     private_dir(path.parent)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        st = os.fstat(fd)
-        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
-                or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink != 1 or st.st_size > MAX_BYTES):
-            fail("Docket client file must be a private owner-only regular file (0600)")
-        raw = os.read(fd, MAX_BYTES + 1)
-    finally:
-        os.close(fd)
+        raw = read_private_bytes(path, max_bytes=MAX_BYTES)
+    except PrivateStorageError:
+        fail("Docket client file must be a private owner-only regular file (0600)")
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeError):
@@ -77,25 +80,10 @@ def read_private(path: Path) -> dict:
 
 def atomic_private(path: Path, value: dict) -> None:
     private_dir(path.parent)
-    if path.exists() or path.is_symlink():
+    if os.path.lexists(path):
         read_private(path)  # Do not replace somebody else's file or follow links.
-    fd, temporary = tempfile.mkstemp(prefix=".client-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            json.dump(value, stream)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    payload = (json.dumps(value) + "\n").encode("utf-8")
+    replace_private_bytes(path, payload, max_bytes=MAX_BYTES, prefix=".client-")
 
 
 def identity(root: Path) -> str:
@@ -233,20 +221,19 @@ def redeem(link: str, root: Path | None = None) -> dict:
     # Serialize operators and refuse accidental re-pair/replacement of an own token.
     lock = root / ".enrolling"
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        create_private_file(lock, b"")
     except FileExistsError:
         fail("enrollment locked; inspect previous attempt before retrying")
-    os.close(fd)
     try:
         binding = root / "client.json"
-        if binding.exists() or binding.is_symlink():
+        if os.path.lexists(binding):
             fail("Docket already has a client binding; explicit operator recovery required")
         attempt_path = root / "attempt.json"
         # Identify the enrollment, not its query/JSON/base64 spelling. Never store secrets.
         digest = hashlib.sha256(json.dumps([data["pairingId"], data["secret"]],
                                            ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
         attempts = []
-        if attempt_path.exists() or attempt_path.is_symlink():
+        if os.path.lexists(attempt_path):
             ledger = read_private(attempt_path)
             # Old raw-link hashes cannot identify equivalent links. No safe automatic migration
             # can establish that an enrollment is unused after an unknown outcome.

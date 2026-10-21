@@ -198,12 +198,18 @@ class DeliveryHonestyTests(unittest.TestCase):
         adapter.inbox.discard(aid)
         adapter.consumed.add(aid)
         sched.tick()
+        self.assertEqual(store.get("dkt_due").status, "admitted")
+        clock.advance(29)
+        sched.tick()
+        self.assertEqual(store.get("dkt_due").status, "admitted")
+        clock.advance(1)
+        sched.tick()
         self.assertEqual(store.get("dkt_due").status, "delivered")
         self.assertEqual(store.get("dkt_due").receipt["state"], "consumed")
         self.assertEqual(len(adapter.sent), 1)
         store.close()
 
-    def test_confirmed_admission_that_vanishes_is_lost_not_replayed(self):
+    def test_confirmed_admission_that_vanishes_is_uncertain_not_replayed(self):
         store, adapter, clock, sched = _world()
         adapter.consume_immediately = False
         store.insert(_item("dkt_due", clock.now()))
@@ -212,11 +218,17 @@ class DeliveryHonestyTests(unittest.TestCase):
         adapter.inbox.discard(aid)
         sched.tick()
         item = store.get("dkt_due")
-        self.assertEqual(item.status, "undeliverable")
-        self.assertTrue(item.error.startswith("lost:"))
+        self.assertEqual(item.status, "ambiguous")
+        req = store.get_request(item.id)
+        self.assertEqual(req["issue"]["code"], "lost")
+        self.assertTrue(req["facts"]["admitted"])
+        self.assertFalse(req["facts"].get("consumed", False))
+        self.assertEqual(req["dispatch_state"], "possible")
         clock.advance(3600)
         sched.tick()
         self.assertEqual(len(adapter.sent), 1)
+        self.assertEqual(store.get_request(item.id)["request_id"], aid)
+        self.assertEqual(sched.recover(store.get(item.id), None, "retry"), (409, "already_admitted"))
         store.close()
 
     def test_conflict_does_not_mint_a_new_id(self):
@@ -234,20 +246,45 @@ class DeliveryHonestyTests(unittest.TestCase):
         self.assertEqual(store.get("dkt_due").receipt["admission_id"], item.receipt["admission_id"])
         store.close()
 
-    def test_unconfirmed_retry_reuses_the_same_id(self):
+    def test_preflight_retry_reuses_the_same_id_and_body(self):
         store, adapter, clock, sched = _world()
-        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        adapter.unavailable = True  # validate fails before begin_send
         store.insert(_item("dkt_due", clock.now()))
         sched.tick()
-        aid = store.get("dkt_due").receipt["admission_id"]
+        before = store.get_request("dkt_due")
+        aid = before["request_id"]
+        self.assertEqual(before["dispatch_state"], "never")
+        self.assertEqual(store.get("dkt_due").attempts, 1)
         self.assertEqual(store.get("dkt_due").status, "pending")
-        adapter.fail = None
+        adapter.unavailable = False
         clock.advance(30)
         sched.tick()
         self.assertEqual(len(adapter.sent), 1)
         self.assertEqual(adapter.sent[0]["admission_id"], aid)
+        self.assertEqual(adapter.sent[0]["message"], json.loads(before["frozen"]["body"])["text"])
+        self.assertEqual(store.get_request("dkt_due")["frozen"], before["frozen"])
+        self.assertEqual(store.get("dkt_due").attempts, 2)
         self.assertEqual(store.get("dkt_due").status, "delivered")
         store.close()
+
+    def test_generic_send_exception_is_status_only_even_after_missing(self):
+        store, adapter, clock, sched = _world()
+        self.addCleanup(store._tmp.cleanup)
+        self.addCleanup(store.close)
+        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        store.insert(_item("dkt_due", clock.now()))
+        sched.tick()
+        before = store.get_request("dkt_due")
+        self.assertEqual(before["dispatch_state"], "possible")
+        self.assertEqual(store.get("dkt_due").status, "ambiguous")
+        adapter.fail = None
+        clock.advance(30)
+        sched.tick()
+        self.assertEqual(store.get("dkt_due").status, "ambiguous")
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(store.get("dkt_due").attempts, 1)
+        self.assertEqual(store.get_request("dkt_due")["frozen"], before["frozen"])
+        self.assertEqual(sched.recover(store.get("dkt_due"), None, "retry"), (409, "acceptance_unknown"))
 
     def test_firing_without_an_id_is_not_resent(self):
         store, adapter, clock, sched = _world()
@@ -340,6 +377,12 @@ class RecurringReliabilityTests(unittest.TestCase):
         adapter.inbox.discard(aid)
         adapter.consumed.add(aid)
         sched.tick()
+        self.assertEqual(store.get_occurrence(occ.id).status, "admitted")
+        clock.advance(29)
+        sched.tick()
+        self.assertEqual(store.get_occurrence(occ.id).status, "admitted")
+        clock.advance(1)
+        sched.tick()
         self.assertEqual(store.get_occurrence(occ.id).status, "delivered")
         self.assertEqual(len(adapter.sent), 1)
         self.assertGreater(store.get("dkt_every").fire_at, clock.now())
@@ -425,11 +468,16 @@ class LeaseOwnershipTests(unittest.TestCase):
 
         adapter.deliver = deliver
         sched.tick()
+        occ = store.list_occurrences("dkt_boom")[0]
+        self.assertEqual(occ.status, "ambiguous")
+        self.assertIn(occ.receipt["admission_id"], adapter.consumed)
         clock.advance(30)
         sched.tick()
         self.assertEqual(calls["n"], 1)
         self.assertEqual(len(store.list_occurrences("dkt_boom")), 1)
-        self.assertEqual(store.list_occurrences("dkt_boom")[0].status, "firing")
+        self.assertEqual(store.list_occurrences("dkt_boom")[0].status, "delivered")
+        self.assertTrue(store.get_request(occ.id)["facts"]["consumed"])
+        self.assertEqual(len(adapter.sent), 1)
         store.close()
 
     def test_cancel_after_occurrence_delivery_is_not_resurrected(self):
@@ -471,7 +519,10 @@ class SchedulerLogTests(unittest.TestCase):
             server.stop()
         logged = buffer.getvalue()
         self.assertIn("scheduler error", logged)
-        self.assertIn("scheduler-boom", logged)
+        diagnostic = "docket: scheduler error: delivery operation failed; check delivery status"
+        self.assertGreaterEqual(logged.count(diagnostic), 2)
+        self.assertTrue(all(line == diagnostic for line in logged.splitlines()))
+        self.assertNotIn("scheduler-boom", logged)
         self.assertNotIn("password", logged.lower())
         log_scheduler_error(RuntimeError("again"))
         store.close()

@@ -6,11 +6,13 @@ A fired item is a notice. Nothing in an item is executed.
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from docket.platform import is_windows
 
 SESSION_RE = re.compile(r"^ses_[A-Za-z0-9]+$")
 DURATION_RE = re.compile(
@@ -68,7 +70,22 @@ def parse_delay(value, *, now: datetime) -> datetime:
 
 
 def local_zone() -> tzinfo:
-    """The machine zone, from /etc/localtime, without a tzdata install."""
+    """Rule-aware calendar zone; never guess a fixed offset on Windows."""
+    configured = os.environ.get("DOCKET_TIMEZONE")
+    if configured:
+        try:
+            return ZoneInfo(configured)
+        except (ValueError, KeyError) as exc:
+            raise ValueError("DOCKET_TIMEZONE requires an available IANA zone (install tzdata)") from exc
+    if is_windows():
+        try:
+            from tzlocal import get_localzone
+            zone = get_localzone()
+            if not isinstance(zone, ZoneInfo):
+                raise ValueError("local zone is not rule-aware")
+            return zone
+        except (ImportError, OSError, ValueError, KeyError) as exc:
+            raise ValueError("Windows local calendar timezone unavailable; install tzlocal/tzdata or set DOCKET_TIMEZONE to an available IANA zone") from exc
     path = Path("/etc/localtime")
     try:
         with path.open("rb") as handle:

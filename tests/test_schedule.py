@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -205,33 +206,42 @@ class RecurringTests(unittest.TestCase):
         store.close()
 
     def test_retry_keeps_the_same_occurrence(self):
+        import json
         store, adapter, clock, sched = _world()
         store.insert(_recurring("dkt_every", clock.now(), every=60, count=3))
-        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        adapter.unavailable = True  # Proven pre-dispatch validation failure.
         sched.tick()
         occ_id = store.get("dkt_every").spec["open_occurrence_id"]
         self.assertEqual(store.get_occurrence(occ_id).attempts, 1)
-        adapter.fail = None
+        prepared = store.get_request(occ_id)
+        self.assertEqual(prepared["dispatch_state"], "never")
+        adapter.unavailable = False
         clock.advance(120)
         sched.tick()
         self.assertEqual(len(adapter.sent), 1)
         self.assertIn(occ_id, adapter.sent[0]["message"])
         self.assertEqual(len(store.list_occurrences("dkt_every")), 1)
+        self.assertEqual(adapter.sent[0]["admission_id"], prepared["request_id"])
+        self.assertEqual(adapter.sent[0]["message"], json.loads(prepared["frozen"]["body"])["text"])
         store.close()
 
     def test_expired_lease_retries_the_open_occurrence(self):
         store, adapter, clock, sched = _world()
         start = clock.now()
         store.insert(_recurring("dkt_every", start, every=60, count=3))
+        adapter.unavailable = True
         sched.tick()
         occ = store.list_occurrences("dkt_every")[0]
-        occ.status = "firing"
-        occ.receipt = {"admission_id": occ.receipt["admission_id"], "state": "prepared"}
-        occ.delivered_at = None
+        prepared = store.get_request(occ.id)
+        self.assertEqual(prepared["dispatch_state"], "never")
+        self.assertEqual(prepared["facts"], {})
+        self.assertEqual(adapter.sent, [])
+        # A genuinely unsent claim in the same daemon expires before preflight.
+        # Do not resurrect a consumed occurrence or erase any positive evidence.
+        self.assertTrue(store.claim_occurrence(occ.id, clock.now()))
+        occ = store.get_occurrence(occ.id)
         occ.firing_at = start - timedelta(seconds=120)
-        aid = occ.receipt["admission_id"]
-        adapter.consumed.discard(aid)
-        adapter.inbox.discard(aid)
+        aid = prepared["request_id"]
         store.save_occurrence(occ)
         parent = store.get("dkt_every")
         spec = dict(parent.spec)
@@ -241,13 +251,15 @@ class RecurringTests(unittest.TestCase):
         parent.fire_at = occ.scheduled_at
         parent.next_attempt_at = clock.now() + timedelta(hours=2)
         store.save(parent)
-        adapter.sent.clear()
+        adapter.unavailable = False
         clock.advance(1)
         sched.tick()
         self.assertEqual(len(adapter.sent), 1)
         self.assertEqual(adapter.sent[0]["admission_id"], aid)
         self.assertIn(occ.id, adapter.sent[0]["message"])
         self.assertEqual(len(store.list_occurrences("dkt_every")), 1)
+        self.assertEqual(store.get_request(occ.id)["frozen"], prepared["frozen"])
+        self.assertEqual(store.get_occurrence(occ.id).attempts, 3)
         store.close()
 
     def test_cancel_stops_later_repeats_and_a_retry(self):
@@ -307,14 +319,17 @@ class RecurringTests(unittest.TestCase):
         self.assertEqual(store.list_occurrences("dkt_bad")[0].status, "undeliverable")
 
         store.insert(_recurring("dkt_blip", clock.now(), every=60, count=3))
-        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        adapter.unavailable = True  # Exhaust only proven pre-dispatch failures.
         sched.tick()
         for _ in range(8):
             clock.advance(120)
             sched.tick()
         self.assertEqual(store.list_occurrences("dkt_blip")[0].status, "undeliverable")
         self.assertEqual(store.get("dkt_blip").status, "pending")
-        adapter.fail = None
+        first = store.list_occurrences("dkt_blip")[0]
+        self.assertEqual(store.get_request(first.id)["dispatch_state"], "never")
+        self.assertEqual(adapter.sent, [])
+        adapter.unavailable = False
         clock.advance(3600)
         sched.tick()
         self.assertEqual(len(adapter.sent), 1)
@@ -506,17 +521,56 @@ class WatchFireTests(unittest.TestCase):
         files = ScriptedStat(FileView("file", dev=1, ino=1, size=3, mtime_ns=1))
         store, adapter, clock, sched = _world(files)
         store.insert(_watch("dkt_latch", clock.now(), check="file_appears", path="/tmp/a", urgent=True))
-        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        adapter.unavailable = True  # proven preflight failure, not a possible send
         sched.tick()
         self.assertEqual(adapter.sent, [])
+        occ = store.list_occurrences("dkt_latch")[0]
+        before = store.get_request(occ.id)
+        self.assertEqual(before["dispatch_state"], "never")
+        self.assertEqual(occ.attempts, 1)
+        self.assertTrue(store.get("dkt_latch").spec["latched"])
+        checks = store.get("dkt_latch").spec["checks"]
         files.view = FileView("missing")
-        adapter.fail = None
+        adapter.unavailable = False
         clock.advance(30)
         sched.tick()
         self.assertEqual(len(adapter.sent), 1)
         self.assertEqual(adapter.sent[0]["delivery"], "steer")
         self.assertIn("file_appears", adapter.sent[0]["message"])
+        self.assertEqual(adapter.sent[0]["admission_id"], before["request_id"])
+        self.assertEqual(adapter.sent[0]["message"], json.loads(before["frozen"]["body"])["text"])
+        self.assertEqual(store.get_request(occ.id)["frozen"], before["frozen"])
+        self.assertEqual(store.get_occurrence(occ.id).attempts, 2)
+        self.assertEqual(store.get("dkt_latch").spec["checks"], checks)
+        self.assertEqual([o.id for o in store.list_occurrences("dkt_latch")], [occ.id])
         store.close()
+
+    def test_latched_watch_possible_dispatch_never_retries_or_relatches(self):
+        files = ScriptedStat(FileView("file", dev=1, ino=1, size=3, mtime_ns=1))
+        store, adapter, clock, sched = _world(files)
+        self.addCleanup(store._tmp.cleanup)
+        self.addCleanup(store.close)
+        store.insert(_watch("dkt_latch", clock.now(), check="file_appears", path="/tmp/a", urgent=True))
+        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        sched.tick()
+        occ = store.list_occurrences("dkt_latch")[0]
+        before = store.get_request(occ.id)
+        self.assertEqual(occ.status, "ambiguous")
+        self.assertEqual(before["dispatch_state"], "possible")
+        checks = store.get("dkt_latch").spec["checks"]
+        files.view = FileView("missing")
+        adapter.fail = None
+        clock.advance(30)
+        sched.tick()
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual([o.id for o in store.list_occurrences("dkt_latch")], [occ.id])
+        self.assertEqual(store.get_occurrence(occ.id).status, "ambiguous")
+        self.assertEqual(store.get_occurrence(occ.id).attempts, 1)
+        self.assertTrue(store.get("dkt_latch").spec["latched"])
+        self.assertEqual(store.get("dkt_latch").spec["checks"], checks)
+        self.assertEqual(store.get_request(occ.id)["frozen"], before["frozen"])
+        self.assertEqual(sched.recover(store.get("dkt_latch"), store.get_occurrence(occ.id), "retry"),
+                         (409, "acceptance_unknown"))
 
 
 class MigrationTests(unittest.TestCase):
@@ -674,6 +728,74 @@ class ScriptedProbe:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+
+class WaitingWatchDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = Store(Path(self.tmp.name) / "docket.db")
+        self.addCleanup(self.store.close)
+        self.adapter = FakeAdapter()
+        self.adapter.validate = Mock(wraps=self.adapter.validate)
+        self.clock = FakeClock(utc(2026, 10, 21, 12, 0, 0))
+        self.view = FileView("missing")
+        checks = Checks(self.adapter, file_stat=lambda _path: self.view)
+        self.scheduler = Scheduler(self.store, self.adapter, self.clock, checks=checks)
+        self.item = _watch("dkt_waiting", self.clock.now(), check="file_appears", path="/unused/ready.txt")
+        self.store.insert(self.item)
+
+    def poll(self):
+        from docket.api import _public_item
+
+        self.scheduler._poll_watch(self.store.get(self.item.id))
+        return _public_item(self.store, self.store.get(self.item.id))
+
+    def test_absent_file_is_waiting_not_provider_validation_failure(self):
+        body = self.poll()
+        # A second normal check must also stay clean, without contacting delivery.
+        self.clock.advance(30)
+        body = self.poll()
+        self.assertEqual(body["status"], "pending")
+        self.assertEqual(body["attempts"], 0)
+        self.assertEqual(body["spec"]["checks"], 2)
+        self.assertFalse(body["spec"]["latched"])
+        self.assertIsNone(body["spec"]["open_occurrence_id"])
+        self.assertEqual(body["spec"]["next_seq"], 1)
+        self.assertIsNone(self.store.get_request(self.item.id))
+        self.assertEqual(body["delivery"]["recovery"], {
+            "reconcile": False, "retry": False, "refusal_code": "not_ready"})
+        self.adapter.validate.assert_not_called()
+        self.assertEqual(self.adapter.sent, [])
+        self.assertIsNone(body["delivery"]["issue"])
+        self.assertIsNone(body["error"])
+
+    def test_unavailable_check_remains_visible_then_normal_wait_clears_it(self):
+        self.view = FileView("unavailable", detail="file check timed out")
+        body = self.poll()
+        self.assertEqual(body["delivery"]["issue"]["code"], "unavailable")
+        self.assertEqual(body["status"], "pending")
+        self.view = FileView("missing")
+        self.clock.advance(30)
+        body = self.poll()
+        self.assertIsNone(body["delivery"]["issue"])
+        self.assertIsNone(body["error"])
+        self.adapter.validate.assert_not_called()
+
+    def test_met_condition_still_validates_and_refuses_unavailable_provider(self):
+        self.view = FileView("file", dev=7, ino=8, size=1, mtime_ns=1)
+        self.adapter.unavailable = True
+        self.poll()
+        self.adapter.validate.assert_called_once()
+        item = self.store.get(self.item.id)
+        self.assertTrue(item.spec["latched"])
+        occ = self.store.open_occurrence(item)
+        req = self.store.get_request(occ.id)
+        self.assertEqual(req["issue"]["code"], "unavailable")
+        self.assertEqual(req["dispatch_state"], "never")
+        self.assertEqual(self.adapter.sent, [])
 
 
 class ApiScheduleTests(unittest.TestCase):

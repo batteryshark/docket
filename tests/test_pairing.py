@@ -480,7 +480,7 @@ class PairingTests(unittest.TestCase):
     def test_unpaired_explicit_and_generic_default_binding_cannot_downgrade(self):
         with patch.dict(os.environ, {"DOCKET_HOME": self.temp.name, "DOCKET_DELIVERY_HOST": "auto"}):
             self.assertIsInstance(configured_adapter(), AutoAdapter)
-        adapter = OpenChamberAdapter(paired=False, settings=self.settings)
+        adapter = OpenChamberAdapter(paired=False, root=self.root, settings=self.settings)
         self.assertTrue(adapter.validate({"session_id": "ses_fake"}).ok)
         self.assertIsNone(self.host.calls[-1][2])
         self.assertEqual(adapter.host_status()["mode"], "unpaired-loopback")

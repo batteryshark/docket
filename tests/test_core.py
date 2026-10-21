@@ -149,15 +149,24 @@ class SchedulerTests(unittest.TestCase):
 
     def test_retry_then_undeliverable(self):
         store, adapter, clock, sched = _world()
-        adapter.fail = DeliveryError("unavailable", "down", retryable=True)
+        # Validation outage is positive proof of pre-dispatch failure, unlike an
+        # exception raised inside deliver (which must remain status-only).
+        adapter.unavailable = True
         store.insert(_item("dkt_retry", clock.now()))
         sched.tick()
         self.assertEqual(store.get("dkt_retry").status, "pending")
+        self.assertEqual(store.get("dkt_retry").attempts, 1)
+        self.assertEqual(store.get("dkt_retry").next_attempt_at, clock.now() + timedelta(seconds=2))
+        sched.tick()
         self.assertEqual(store.get("dkt_retry").attempts, 1)
         for _ in range(8):
             clock.advance(120)
             sched.tick()
         self.assertEqual(store.get("dkt_retry").status, "undeliverable")
+        request = store.get_request("dkt_retry")
+        self.assertEqual(request["dispatch_state"], "never")
+        self.assertEqual(store.get("dkt_retry").attempts, 8)
+        self.assertEqual(adapter.sent, [])
         store.close()
 
     def test_reopen_does_not_lose_a_pending_item(self):

@@ -383,7 +383,7 @@ async function main() {
       'late by 42s',
       'Next check',
       'file_stable',
-      'Project /example/projects/demo-b',
+      'Project /example/projects/downloads',
     ]) {
       if (!shown.includes(expected)) problems.push('panel did not show ' + expected);
     }

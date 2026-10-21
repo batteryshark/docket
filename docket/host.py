@@ -50,24 +50,43 @@ class OpenChamberAdapter(OpenCodeAdapter):
     def host_status(self):
         return dict(self._status)
 
-    def _request(self, method, path, body=None):
+    def _resolve_transport(self):
+        """Capture once: the checked metadata and actual I/O share this exact record.
+
+        The credential stays in this operation only, never in the public/frozen snapshot.
+        Re-reading settings or client.json after checking would introduce a TOCTOU route.
+        """
+        if _configured(self.root):
+            self.paired = True
+        origin = desktop_origin(self.settings)
+        binding = dict(read_private(self.root / "client.json")) if self.paired else {}
+        if self.paired and (binding.get("version") != 1
+                            or not valid_client_id(binding.get("clientId"))
+                            or not valid_client_token(binding.get("clientToken"))):
+            raise DeliveryError("refused")
+        snapshot = {"adapter": self.name, "mode": "paired" if self.paired else "unpaired-loopback",
+                    "origin": origin, "client_id": binding.get("clientId"),
+                    "namespace_verified": False}
+        return snapshot, binding
+
+    def binding_snapshot(self):
+        snapshot, _binding = self._resolve_transport()
+        return snapshot
+
+    def _request(self, method, path, body=None, *, expected_binding=None):
         try:
             self._status["checked_at"] = datetime.now(timezone.utc).isoformat()
             self._status["origin"] = None
-            if _configured(self.root):
-                self.paired = True
-                self._status["mode"] = "paired"
             # Rediscover on EVERY call, not once at daemon launch; never consult OpenCode credentials.
-            origin = desktop_origin(self.settings)
+            snapshot, binding = self._resolve_transport()
+            if expected_binding is not None and snapshot != expected_binding:
+                raise DeliveryError("backend_unverifiable", not_dispatched=True)
+            origin = snapshot["origin"]
+            self._status["mode"] = snapshot["mode"]
             self._status["origin"] = origin
             health(origin)
-            token = None
-            if self.paired:
-                binding = read_private(self.root / "client.json")
-                token = binding.get("clientToken")
-                if (binding.get("version") != 1 or not valid_client_token(token)
-                        or not valid_client_id(binding.get("clientId"))):
-                    raise PairingError("invalid Docket client binding")
+            token = binding.get("clientToken")
+            if snapshot["mode"] == "paired":
                 status, result = json_request(origin, "GET", "/api/client-auth/clients", token=token,
                                               timeout=self.timeout)
                 clients = result.get("clients") if isinstance(result, dict) else None
@@ -127,12 +146,17 @@ class AutoAdapter(OpenCodeAdapter):
         self.root = root
         self.desktop = None
 
-    def _request(self, method, path, body=None):
+    def binding_snapshot(self):
+        if self.desktop is None and _configured(self.root):
+            self.desktop = OpenChamberAdapter(root=self.root)
+        return self.desktop.binding_snapshot() if self.desktop else super().binding_snapshot()
+
+    def _request(self, method, path, body=None, *, expected_binding=None):
         if self.desktop is None and _configured(self.root):
             self.desktop = OpenChamberAdapter(root=self.root)
         if self.desktop is not None:
-            return self.desktop._request(method, path, body)
-        return super()._request(method, path, body)
+            return self.desktop._request(method, path, body, expected_binding=expected_binding)
+        return super()._request(method, path, body, expected_binding=expected_binding)
 
     def host_status(self):
         return self.desktop.host_status() if self.desktop else super().host_status()
