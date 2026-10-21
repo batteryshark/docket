@@ -1,358 +1,278 @@
 # Docket
 
-Historical Mac 0.3.0 own-client OpenChamber pairing and delivery were accepted; see
-[PAIRING.md](PAIRING.md). A generic
-installation can run before pairing; pairing requires principal consent.
+<p><a href="assets/workstack-mark-full.png"><img src="assets/workstack-mark.png" alt="Docket: a comic alarm-clock mascot holding a reminder card" width="180"></a></p>
 
-A small always-on local service that wakes an agent session when a timer, an
-alarm, a recurring schedule, or a built-in watch is due. Milestone 2 adds
-bounded recurring wakes and cheap read-only watches. Delivery does not treat
-an admission as consumed. OpenChamber's archive overlay is checked when that
-file is present, and the pending view includes every outstanding state. The
-OpenChamber panel lists outstanding items and undeliverable history, and can
-remove an item. Historical Mac acceptance included visual approval and installed
-relay health/snapshot/remove. This is not current source/platform acceptance or
-completion of the whole goal. The panel does not deliver
-wakes and needs no delivery callback. See the host-selection limits below.
+**Wake an agent session later, without leaving a polling agent running.**
 
-An optional [Pi companion adapter](docs/pi.md) has verified bounded native Windows
-queue saved intake through the normal installed Docket route and published 0.2.0
-companion. `delivered` means exact saved intake, not execution. Pi selection is
-per target (`--adapter pi`); default OpenCode/paired delivery is unchanged, with
-no Pi fallback. See the setup, private-config requirements and availability/proof
-limits before use; this is not unattended or universal Windows assurance.
+Docket is a bounded local scheduler for OpenCode sessions: timers, alarms,
+interval recurrence and built-in watches. It provides a CLI, a loopback HTTP
+API and stdio MCP, with SQLite persistence and Python 3.11+ on macOS, Linux and
+Windows. The Unix core uses the standard library; Windows also requires
+`tzlocal>=5.0` and `tzdata`. An optional OpenChamber panel lists and removes
+items; it does not deliver wakes. An optional [Pi companion adapter](docs/pi.md)
+targets an existing persistent Pi recipient, with saved-intake-only evidence.
 
-Python 3.11+; Unix core uses the standard library, while Windows declares
-`tzlocal>=5.0` and `tzdata`. The service binds to `127.0.0.1:8768` and
-will not listen on any other address. Unix state lives in `~/.docket/` (`docket.db`,
-`token`, `server.json`; log visibility depends on the service backend). The directory is
-mode `0700`. The database, its WAL and SHM files, the token, and `server.json`
-are mode `0600`. Windows defaults to `%LOCALAPPDATA%\Docket` with native private
-storage guards. `DOCKET_HOME` selects an explicit private state root, not a
-migration. See [per-user services](docs/services.md) for platform setup and limits. The token
-and the OpenCode service password are read at runtime and are never written to
-the repo or to item records.
+## Why use Docket?
 
-A process that is already running keeps the code it started with. Historical Mac
-0.3.0 acceptance covered own-client delivery, retained items through upgrade and
-Docket-service restart, and fresh wake/ACK and installed relay removal after a
-principal-managed app update. No automatic app restart is authorized.
-That historical acceptance does not certify newer source/platform behavior.
+Many agent harnesses already offer recurring automations. Docket lives outside
+the harness: it lets a compatible agent arrange a later wake or check-in during
+ongoing work, not just set up recurring routines.
 
-## Start, stop, uninstall
+For example, an agent can ask to be woken in 20 minutes to check a download
+expected to finish then. Or it can start a background job and arrange a later
+check-in, or set a regular reminder. A note in a Markdown file does not wake a
+session, and keeping an agent in a model-powered polling loop is unnecessary.
 
-For Linux systemd user units and Windows per-user interactive-logon tasks, use
-the [portable service runbook](docs/services.md). It covers persistent source/runtime
-requirements, platform state/log locations, uninstall retention and the Windows
-installation-root reconfiguration gap. Native Windows corrected restart,
-uninstall/reinstall retention and reboot/logon acceptance remain unproven.
-These reference commands do not authorize running a safety-held host.
+An ad-hoc background polling process can disappear when its harness restarts or
+crashes—or be forgotten and left running. Docket keeps schedules in SQLite,
+separate from the harness's lifetime, and uses bounded watches and recurrences
+rather than forgotten open-ended loops. The CLI gives you one place to inspect
+and cancel schedules; the optional panel makes them visible too. Docket must be
+running to check or deliver, and the target host must be available and compatible:
+persistence is not guaranteed delivery across downtime, and missed recurrence
+intervals coalesce rather than all replaying.
 
-The approved user LaunchAgent is `local.docket`. The plist is
-`~/Library/LaunchAgents/local.docket.plist`. Install pins the running absolute
-Python 3.11+ interpreter (retaining a virtualenv symlink path), invokes
-`python -m docket daemon`, and sets this package's root as WorkingDirectory.
-`DOCKET_PYTHON` can select the installer interpreter via `bin/docket`; it is not
-stored or reselected at daemon startup. Moving code/runtime or changing captured
-settings requires deliberate reinstall; source changes do not update an existing job.
+Docket schedules the wake, or checks a bounded watch condition, and asks the
+host to resume the existing compatible session when due. It does not run the
+download or background job itself, and a check-in does not guarantee that work
+has finished. Watches still perform periodic checks; they do not keep a model
+running. Other harnesses need a compatible delivery adapter, not just Docket
+installed alongside them. Codex and Claude Code existing-session wake parity is
+not established.
 
-The plist captures only PATH, HOME, USER, LOGNAME, canonical DOCKET_HOME and
-DOCKET_DELIVERY_HOST (`auto`, `opencode`, `openchamber-paired`, or
-`openchamber-unpaired`). Credentials and unrelated variables are not copied.
-Mac install alone accepts an explicit already-absolute state symlink to an
-existing dedicated private directory, validates the canonical target with the
-unchanged owner/mode guards, and pins that target. Broad permissions, dangling
-or relative aliases are refused, not repaired. Use the canonical path for clients;
-no state is migrated and ordinary storage still rejects symlink roots.
+## Quick start
 
-```
-bin/docket service install      # write the plist, bootout any previous job, start it
-bin/docket service start        # bootstrap the plist, or kickstart if already loaded
-bin/docket service stop         # bootout. The plist stays, so it does not come back until start
-bin/docket service restart      # kickstart -k
-bin/docket service status
-bin/docket service uninstall    # bootout and delete the plist
+From a stable checkout with Python 3.11+, on macOS or Linux:
+
+```sh
+git clone https://github.com/batteryshark/docket.git
+cd docket
+python3 -m docket --help
+python3 -m docket serve
 ```
 
-`bin/docket serve` runs the same process in the foreground. Stop it with
-Ctrl-C. Do not run `serve` and the LaunchAgent together; they share one port.
+On Windows, with Python 3.11+ available as `python`, use PowerShell:
 
-These commands manage Docket only, not OpenChamber or a shared OpenCode server.
-Coordinate maintenance around pending items; stopping prevents due-time delivery.
-Uninstall removes the job/plist, not the retained state. Before an upgrade, take a
-private, consistent SQLite backup including WAL (the verified upgrade used the
-online backup API), check integrity and item invariants, and preserve the own-client
-binding. Never blindly restore a DB or copy an old file over a live database:
-restoring can discard newer items/receipts or replay stale pending work. Recovery
-requires explicit coordination, a stopped Docket service and reviewed state.
-
-## What you can set
-
-A timer is a delay: `20m`, `in 20 minutes`, `90s`, `1h30m`, or a number of
-seconds. An alarm is a local clock time `HH:MM` (today if it is still ahead or
-at most a minute past, otherwise tomorrow) or an ISO-8601 timestamp. A
-timestamp already in the past fires on the next tick and is reported late.
-
-A recurring item wakes on a fixed interval. `every` is at least 60 seconds.
-A `count` (1 to 100) or an `until` (at most 90 days out) is required; both may
-be set, and whichever comes first stops the series. The first fire is one
-interval from now unless `start` says otherwise. `count` is the number of
-wakes attempted. Slots skipped while the machine was asleep do not consume it.
-
-A watch wakes once, when a built-in check matches. It needs an `until`. The
-checks are `file_appears`, `file_stable` (the file stops growing),
-`process_ended`, `url_answers`, and `session_idle`. Docket does not accept a
-command, a script, or a principal notification.
-
-A fire more than 5 seconds after its scheduled time is marked late. The notice's
-lateness text is measured at admission; final item lateness may include queue
-consumption wait. The wake does not guess why. If a recurring item misses several
-intervals, one late wake is delivered for the slot that was owed, the notice says how
-many earlier intervals were coalesced, and the next fire is the next slot
-strictly in the future. Missed slots are not delivered one by one. Slots after
-`until` are not counted as coalesced. When the series is finished, Remaining
-is 0, not the unused count.
-
-The default target is an OpenCode session id (`ses_…`); explicit Pi targets use
-`--adapter pi --session pi/<id>` with the [Pi setup and restrictions](docs/pi.md).
-For OpenCode, Docket checks that the session
-exists and is not archived when the item is set and again when it fires. If
-you pass a directory, the session's location must still match at both times;
-a mismatch is a wrong target. A missing, archived, or wrong target is rejected
-at creation. If it becomes invalid before the fire, that occurrence is kept as
-`undeliverable`. A dead target stops a recurring series. A delivery outage
-that exhausts retries records that occurrence as undeliverable and, if the
-series still has budget, continues at the next future slot. The miss is in
-`docket occurrences` and is named in the next wake.
-
-Docket does not execute item commands or contact the principal directly.
-`context` is delivered as data.
-A top-level `command` or `script` field is rejected. A `command` key inside
-`context` is still only data. `urgent` must be a JSON boolean. The string
-`"false"` is rejected, not treated as true.
-
-If `~/.config/openchamber/sessions-archive.json` exists (or
-`$OPENCHAMBER_DATA_DIR/sessions-archive.json`), a session id whose value is a
-positive timestamp is archived even when OpenCode's `time.archived` is empty.
-A missing file is not an error and does not require OpenChamber to be running.
-An unreadable file is treated as unavailable, not as "nothing is archived".
-Docket only reads that file. It does not write OpenChamber settings, and the
-scheduler does not import the overlay.
-
-## Limits
-
-These are enforced at create time. `GET /api/v1/meta` returns the same numbers.
-
-| Limit | Value |
-|---|---|
-| Recurring interval | 60 seconds to 90 days |
-| Recurring count | 1 to 100, or an `until` within 90 days |
-| Pending items for one target | 20, of which at most 5 recurring and 8 watches |
-| Pending recurring or watches for one setter | 5 recurring, 8 watches. `created_by` is a self-reported label, not an authenticated id. An omitted label uses the anonymous bucket. A blank label is rejected. Per-target and global caps do not use the label. |
-| Pending items on the service | 200 |
-| File, process, and session poll | at least 5 seconds, default 15; `until` at most 7 days |
-| URL poll | at least 30 seconds, default 60; `until` at most 24 hours |
-| File stable window | 10 seconds to 6 hours, default 60 |
-| URL fetch | 5 second hop, 8 second deadline, 2 redirects, 2048 byte body |
-
-A file check stats one absolute path in a short-lived child, so a stuck mount
-cannot hang the service. It does not read the file. Stability is device,
-inode, size, and mtime. A shrink, a rewrite, or a replaced inode resets the
-window. Content is not hashed. A `file_stable` watch is rejected when the
-first sample plus the stable window cannot finish before `until`.
-It detects a quiet window, not semantic producer finality: it cannot know future
-writes, even after a successful wake.
-
-Watch checks run on a fixed pool of two threads with a backlog of four. A full
-backlog is skipped until the next tick, not queued without bound. A due timer,
-alarm, or recurring wake is delivered before those checks and does not wait
-on a slow URL, file, or session probe.
-
-A process watch records the pid and the `ps` start stamp at create time. The
-process must be running then. Later, a missing pid means it exited. The same
-pid with a different start stamp means the pid was reused, which also counts
-as ended. If `ps` times out, the watch waits; it does not treat that as ended.
-
-A URL watch fetches `http` or `https` only, with no username, password, or
-custom headers. Redirects stay on the original scheme, host, and port. A
-redirect that changes host or port, including to another loopback port, is not
-followed. The default match is a final 2xx. `expect: any` accepts any
-completed response. A timeout, a refusal, a 5xx, or too many redirects is not
-a match. The body is discarded.
-
-A session-idle watch reads the session and the active-session list. It does
-not read message history. An outage is not idle. A missing or archived
-watched session ends the watch as undeliverable. Already idle matches on the
-first successful check; the watch does not require having seen it busy.
-
-## Delivery
-
-OpenCode admits a prompt in one call. Docket uses that admission and does not
-check "is the session busy?" and then send. The session-idle watch is the
-only place that reads the active list, and it does not send.
-
-- Default: `delivery: "queue"`, `resume: true`. Native queue proof is natural
-  assistant finish followed by a new user message/ACK within the same active
-  drain. An idle session is woken; this is not a stronger guarantee about a
-  continuing multi-step task or a separate drain.
-- Urgent (`--urgent`): `delivery: "steer"`, `resume: true`. Delivery is at a
-  model-step boundary, not during token generation. Mid-token interruption is
-  not promised.
-
-Admission is not consumption or execution. Current delivery records preserve a
-stable request ID and immutable envelope before sending. For OpenCode, `delivered`
-requires a matching saved user transcript message with the exact ID and frozen
-text, not ID-only visibility; Pi requires a consumed / `saved_exact` receipt.
-Possible dispatch, including an unconfirmed send, is **status-only** for both
-adapters: it is never resent. Lost
-visibility remains uncertain; a missing receipt does not prove non-delivery.
-Only bounded proven pre-dispatch recovery can reuse the original ID/body/target,
-subject to core binding/budget checks. See [delivery status and recovery](docs/delivery-status.md)
-for exact CLI/HTTP operations, separate lifecycle/outcome facts, cancellation
-uncertainty and compact panel read limits. Completed recurrence is not proof
-that all occurrences were consumed; coalesced slots are not delivered wakes.
-
-Each recurring wake and each latched watch has its own occurrence id. A later
-repeat is a new occurrence, not a retry of an earlier one. Cancel the item id
-to stop a series. Cancellation asks the host to retract the durable admission
-id, including the sending window before `inbox_id` was saved. Consumed, missing,
-lost, unreadable or failed-drop outcomes do not claim removal. Host-accept races
-make retraction best-effort, not an absolute undo. Cancelling does not delete the
-occurrence row or mint a new wake id.
-
-## Host selection and limits
-
-Before pairing, a generic installation uses `docket/delivery.py`, discovering
-the official older OpenCode service from `~/.local/state/opencode/service.json`
-and using its runtime basic credential. Non-loopback OpenCode URLs are refused.
-Queue guarantees apply only on the host owning the turn; shared-database
-transcript visibility or idle delivery does not prove busy-turn ownership.
-
-The actual verified 0.3.0 deployment is instead paired, after principal consent.
-`docket/host.py` uses Docket's own client bearer against the current loopback
-desktop origin, rediscovering its port; OpenChamber routes to its managed runtime.
-Before every paired session request, the own-id guard requires exactly one
-matching active client record with no expiry or revocation. Labels are arbitrary;
-renaming the same own record does not break delivery. The own token is atomically
-saved before optional response metadata checks. Missing, unreadable, revoked,
-expired or mismatched binding fails visibly: no silent old-service fallback or
-unauthenticated retry, and no borrowing another client's credentials.
-
-That guard is not a host-enforced capability boundary. Optional-auth loopback
-may accept no bearer or a bogus bearer; own-record checks and a guard/request
-race do not prove host-enforced authentication. Real revocation remains unproven.
-The absent `desktopLocalClientToken` blocker is **historical**, not a current
-delivery blocker; supported own-client pairing replaced that approach. See
-[PAIRING.md](PAIRING.md) for the procedure and its limits.
-
-## CLI
-
-The CLI talks to the running service. Mutations send `Authorization: Bearer`
-with the token in `~/.docket/token`.
-
-```
-bin/docket timer --in 20m --session ses_… --reason "check the file"
-bin/docket alarm --at 09:00 --session ses_… --reason "morning check"
-bin/docket recurring --every 15m --count 8 --session ses_… --reason "check again"
-bin/docket recurring --every 1h --until 6h --session ses_… --reason "…"
-bin/docket watch --check file_stable --path /abs/file --until 6h --session ses_… --reason "download finished"
-bin/docket watch --check process_ended --pid 123 --until 2h --session ses_… --reason "job finished"
-bin/docket watch --check url_answers --url http://127.0.0.1:9/health --until 30m --session ses_… --reason "up"
-bin/docket watch --check session_idle --watch-session ses_… --until 1h --session ses_… --reason "idle"
-bin/docket list
-bin/docket list --status all
-bin/docket list --status undeliverable
-bin/docket occurrences
-bin/docket occurrences dkt_… --status undeliverable
-bin/docket cancel dkt_…
+```powershell
+git clone https://github.com/batteryshark/docket.git
+Set-Location docket
+python -m pip install -e .
+python -m docket --help
+python -m docket serve
 ```
 
-`--by` records who set the item. `--directory` pins the session location.
-`--context '{"file":"a"}'` is stored and quoted in the wake. `--json` prints
-the API body. `--start` on a recurring item is a duration or an ISO timestamp,
-not a bare clock time.
+No dependency installation is needed to run from source on Unix. The Windows
+install provisions the declared timezone dependencies and needs pip and Hatchling
+build tooling. `serve` starts the **real scheduler**, not a dry run, at
+`http://127.0.0.1:8768`; non-loopback binding is refused. Ctrl-C stops it. Do not
+run it alongside an installed daemon. Review [host setup](#host-setup) before
+scheduling: delivery requires a compatible local host and an existing session.
 
-## HTTP
+For an installed `docket` command, optionally use an isolated virtual environment
+and `python3 -m pip install -e .` (Windows: `python -m pip install -e .`). The
+Unix source launcher `bin/docket` selects an available Python >=3.11;
+`DOCKET_PYTHON` can pin its executable. `python3 -m docket` uses the invoked interpreter.
+For persistent deployments, use the explicit runtime/root requirements in the
+[service runbook](docs/services.md); installation does not copy source or provision
+a service runtime.
 
-Loopback only. Reads are open to loopback clients. Mutations need the bearer
-token.
+## Schedule a wake
 
-```
-GET  /health
-GET  /api/v1/meta
-GET  /api/v1/items?status=pending|outstanding|firing|admitted|ambiguous|all|delivered|completed|cancelled|undeliverable|expired
-GET  /api/v1/items/{id}
-GET  /api/v1/items/{id}/occurrences
-GET  /api/v1/occurrences?status=undeliverable
-POST /api/v1/timers          {"in","reason","session_id","urgent?","context?","created_by?","directory?"}
-POST /api/v1/alarms          {"at","reason","session_id", ...}
-POST /api/v1/recurring       {"every","reason","session_id","count?","until?","start?", ...}
-POST /api/v1/watches         {"check","until","reason","session_id","every?","path?","stable_for?","pid?","url?","expect?","watch_session?", ...}
-POST /api/v1/items           kind timer, alarm, recurring, or watch
-POST /api/v1/items/{id}/cancel
-```
+After host setup, use another terminal. Set `TARGET_SESSION` to an existing
+session ID and replace `ITEM_ID` with the ID returned by a create command.
+These examples use a Unix shell:
 
-`status=pending` (the default list) is every outstanding state: `pending`,
-`firing`, `admitted`, and `ambiguous`. A firing claim is not hidden. Item
-lists include an `occurrences` count and, when a wake is in flight, an
-`open_occurrence`. A watch that ends without a match is `expired`. A series
-that finishes after at least one consumed delivery is `completed`. Request
-bodies are capped at 64 KiB. A negative `Content-Length` is rejected, and a
-body that does not arrive within 5 seconds is cut off.
-
-## MCP
-
-`bin/docket mcp` is a stdio MCP server (newline-delimited JSON-RPC, and
-Content-Length framing). Tools: `docket_timer`, `docket_alarm`,
-`docket_recurring`, `docket_watch`, `docket_list`, `docket_occurrences`,
-`docket_cancel`. It calls the local HTTP API, so any host that can spawn a
-process can use it. It is not registered in OpenCode or OpenChamber config.
-
-```
-bin/docket mcp
+```sh
+python3 -m docket timer --in 20m --session "$TARGET_SESSION" --reason "check progress"
+python3 -m docket alarm --at 09:00 --session "$TARGET_SESSION" --reason "review"
+python3 -m docket recurring --every 15m --count 4 --session "$TARGET_SESSION" --reason "check again"
+python3 -m docket list
+python3 -m docket occurrences
+python3 -m docket cancel "$ITEM_ID"
 ```
 
-Point the host at that command. `DOCKET_URL` and `DOCKET_TOKEN` override
-discovery. Host-neutral setup examples and usage rules for the chief and the
-leads are in `AGENT_USAGE.md`. Do not write those examples into a global
-prompt, an OpenCode config, an OpenChamber setting, or another project.
+In PowerShell, use `python -m docket`, `$env:TARGET_SESSION` and `$env:ITEM_ID`
+instead. For an installed Windows service, use its recorded source root and
+venv console interpreter as described in [services](docs/services.md), not a
+different Python selected from PATH.
 
-## Panel
+- Recurrence requires `count` (1–100) or an `until` within 90 days, with an
+  interval of at least 60 seconds. Missed intervals coalesce rather than replay.
+- Watches require `until`. Checks are `file_appears`, `file_stable`,
+  `process_ended`, `url_answers` and `session_idle`; see `python3 -m docket watch --help`.
+  File stability means a quiet metadata window, not semantic producer completion.
+  URL checks have no custom headers and cannot redirect to another origin.
+  Process identity must be visible to the daemon; unavailable identity is not exit.
+- `--directory` pins the OpenCode target location. Missing, archived or
+  wrong-location targets are refused or become undeliverable. An unreadable
+  archive overlay is unavailable, not an empty archive.
+- Items cannot execute commands or scripts. Context is data, not instructions.
+  Docket neither reserves model quotas nor dispatches arbitrary worker processes
+  or contacts the operator directly. A woken agent may act on its own instructions.
+- Pi selection is explicit per target: `--adapter pi --session pi/<id>`.
+  Default OpenCode/paired delivery is unchanged, with no Pi fallback. Read the
+  [Pi setup and restrictions](docs/pi.md) first; Pi does not support directory
+  pinning or `session_idle` watches, and Docket never launches Pi.
 
-The listing panel is `openchamber/`. Choose that folder inside your own checkout
-after independent review, not from an agent session:
+## What delivery means
 
-`<your-docket-checkout>/openchamber`
+Normal wakes use `queue` with `resume: true`; urgent wakes use `steer` at a model
+step boundary, not mid-token interruption. Queue proof is within the owning
+host's active drain; it does not guarantee continuation of an arbitrary multi-step
+task or a separate drain.
 
-It shows outstanding items and undeliverable history, and it can remove an
-item. Removal of an already consumed wake says so and does not claim the wake
-was removed. The panel has no authenticated callback to the host that owns
-the current turn, and it does not deliver wakes. It does not change the app,
-the host, or settings. Its list/history/remove relay keeps the Docket API token
-server-side, never in the iframe. Historical Mac acceptance included installed
-host-route relay/removal, not UI-click automation. See
-[panel documentation](openchamber/README.md) for current scope and limits.
+**Admission is not consumption or execution.** Each occurrence persists a stable
+request ID and immutable envelope before sending. OpenCode `delivered` requires
+a saved user transcript message with the exact frozen ID and text in the bound
+target, not ID-only visibility. Pi requires a consumed / `saved_exact` receipt;
+admission, claim and injection are not saved intake, execution or model readiness.
+Execution remains unknown; an assistant ACK is separate evidence.
 
-There is no cron expression; recurrence is an interval from an anchor. A file
-watch does not hash content, and a URL watch sends no custom headers. There
-is no panel delivery relay; paired delivery belongs to the Docket daemon.
+**Possible dispatch is status-only, never a resend.** Missing receipts or lost
+visibility remain uncertain, not proof of non-delivery. `failed` is distinct from
+`uncertain` and is not permission to create a replacement wake. Only bounded,
+core-authorized proven pre-dispatch recovery may reuse the original frozen
+ID/body/target, subject to binding and budget checks. Prepared requests cannot
+retry after daemon ownership loss, restart or binding change; provider namespace
+verification is not established. See [delivery status and recovery](docs/delivery-status.md)
+for the exact CLI/HTTP operations, legacy limits and refusal handling. Do not edit
+state, rotate identity or use another client/target to bypass a refusal.
 
-## Tests
+An admitted or uncertain occurrence holds the next recurrence until resolved.
+A `completed` series does not prove every occurrence was consumed; coalesced
+slots are not delivered wakes. Cancel stops the item/series and attempts to
+retract the admission, including during sending. Retraction is best-effort: it
+cannot undo consumed work, and missing, unreadable, lost or failed-drop outcomes
+do not claim undo. Inspect schedule stop and retraction separately; service stop
+is not retraction. History and positive facts are retained. Admission-time
+lateness may differ from final consumption lateness.
 
-**Browser safety stop:** do not run full test discovery or browser/CDP checks.
-The historical browser-era full suite was not green: two browser-startup
-failures occurred before panel code. Installed Chrome's updater escaped isolation;
-no further browser-driven jobs until containment is independently verified.
-This documentation does not authorize resuming that lane.
+## Host setup
 
-`tests/test_panel_relay.py` is part of `discover`. It starts an isolated
-Docket on a free port under a temporary `DOCKET_HOME`, a loopback relay, and
-headless Chrome with its own user-data directory. It does not open
-`~/.docket` and does not restart `local.docket`.
+Generic unpaired discovery reads the URL from
+`~/.local/state/opencode/service.json`, falling back to `opencode service status`.
+It reads the runtime password from that state file or, as a fallback,
+`~/.config/opencode/service.json`, using Basic auth with username `opencode`.
+The host URL must be loopback; keep these credential files private.
 
-Historical Mac pairing/relay acceptance is not a fully green suite or current
-native-platform certification. Real revocation remains unproven; do not destroy
-the final credential for a test or declare the whole goal done.
+The caller's host must support `POST /api/session/{session_id}/prompt` with a
+caller-supplied stable `msg_` ID, `text`, `delivery: queue` or `steer`, and
+`resume: true`. Retrying an admitted ID must preserve the original admission
+without duplicating it. Reconciliation requires
+`GET /api/session/{session_id}/message/{id}` and
+`GET /api/session/{session_id}/inbox`; cancellation requires
+`DELETE /api/session/{session_id}/inbox/{id}`. Message lookup must distinguish
+exact frozen user-message consumption from an item still in the inbox.
+
+Check compatibility on the caller's host before real scheduling. Merely sharing
+a transcript database or delivering to an idle session does not prove ownership
+of a busy turn. Historical Mac 0.3.0 own-client pairing, delivery, retained items
+through Docket-service restart and installed panel relay/removal were accepted;
+this does not certify newer source/platform behavior or authorize app restart.
+
+Optional OpenChamber own-client pairing requires explicit operator consent;
+follow [PAIRING.md](PAIRING.md). It grants **broad session API access**, not
+wake-only permissions. Paired mode uses Docket's own binding and rediscovers
+the desktop loopback port. Enrollment latches host selection; missing, expired,
+revoked, unreadable or mismatched binding fails without credential borrowing,
+old-service or unauthenticated fallback.
+
+The own-record guard is **not host-enforced authentication or capability proof**.
+Optional-auth loopback hosts may accept missing/bogus bearers, and a guard/request
+race remains. Live revocation is unproven; synthetic refusal tests are not proof.
+Do not destroy the last credential to test revocation.
+
+### Optional macOS service
+
+`python3 -m docket service` supports `install`, `start`, `stop`, `restart`,
+`status` and `uninstall` for the existing user LaunchAgent. **Mac install starts
+the job; never run it alongside `serve`.** Installation pins the running Python
+executable and package location, not `bin/docket`. Relocation requires reinstalling.
+
+State defaults to `~/.docket`; `DOCKET_HOME` must resolve to a nonempty absolute
+path. `DOCKET_DELIVERY_HOST` accepts `auto` (default), `opencode`,
+`openchamber-paired` or `openchamber-unpaired`; enrollment still takes precedence.
+The plist persists only PATH, HOME, USER, LOGNAME, resolved DOCKET_HOME and
+DOCKET_DELIVERY_HOST, not the whole environment or credentials. Changes require
+reinstallation; existing state is not migrated. Stopping prevents delivery;
+uninstall does not erase state or history. The [service runbook](docs/services.md)
+documents the unchanged Mac canonical-state-alias guard and log locations.
+
+### Linux and Windows services
+
+The same service actions manage a Linux systemd user unit or a Windows per-user
+interactive-logon task. Follow the [platform service runbook](docs/services.md)
+for explicit persistent source/runtime selection, private storage, logs, individual
+lifecycle commands and retained state. Linux install enables/starts the unit;
+Windows install registers but does **not** start the task. Windows requires the
+recorded venv console `python.exe` for manual CLI calls and `pythonw.exe` for
+the scheduled daemon. A changed deployment is refused, not silently upgraded;
+uninstall retains the Windows manifest, including its reconfiguration restrictions.
+
+Docket does not manage the agent host. The runbook includes separate, optional
+OpenCode startup recipes: Linux boot availability depends on existing user-manager/
+linger policy; Windows requires interactive logon, not a logged-out boot service.
+Native Linux reboot with automatic services and a retained timer wake/ACK was
+accepted. Actual Windows logon automatically started both services and the
+original retained watch produced exact saved intake and a completed tool-free ACK.
+Windows OS reboot was **not separately tested**. These are bounded demonstrations,
+not universal availability or task-execution guarantees. Pi saved intake does not
+prove Pi startup, unattended availability, authentication or model readiness.
+
+## API, MCP and private state
+
+API reads are local; mutations require the Docket bearer token. Metadata is at
+`GET /api/v1/meta`, with listings at `/api/v1/items` and `/api/v1/occurrences`.
+Pending listings include firing, admitted and ambiguous states. Lifecycle and
+delivery outcome are separate; see [delivery status](docs/delivery-status.md) for
+filters, status-only reconciliation and conservative retry. Compact panel history
+is bounded and may be truncated or unavailable, not an exhaustive audit.
+
+`python3 -m docket mcp` exposes stdio JSON-RPC tools for creating, listing and
+cancelling schedules through the running API; it does not register itself in
+host configuration. There are no MCP reconcile/retry tools. `DOCKET_URL` and
+`DOCKET_TOKEN` override discovery; protect them as private configuration.
+See [AGENT_USAGE.md](AGENT_USAGE.md) for host-neutral setup and usage rules;
+these examples are not permission to change global prompts or host settings.
+
+`~/.docket/` on macOS/Linux, or `%LOCALAPPDATA%\Docket` on Windows, holds SQLite,
+token, server metadata and private records; log locations vary by backend.
+Pairing adds private binding/enrollment records. POSIX state is owner-only;
+Windows uses native private storage guards without ACL repair. `DOCKET_HOME`
+selects a different private root, not a migration. Keep state out of source control.
+Back up SQLite consistently (including WAL semantics), preserve bindings and service
+records, and never copy an old database over a live one: it can discard history or
+replay stale work. Do not let an old writer retry newer immutable-request state.
+Recovery requires coordinated, stopped-service review. The optional archive overlay
+is read, never modified; an unreadable overlay is not treated as no archived sessions.
+
+## Optional OpenChamber panel
+
+![Docket panel showing zero outstanding items, one undeliverable item and a service 0.3.0 notice](assets/screenshots/q88-manual-srgb-docket.png)
+
+Genuine panel screenshot: **0 outstanding, 1 undeliverable**, not an
+empty healthy scheduler. The service upgrades separately; the panel does not
+restart it. This is not proof of delivery, pairing, restart or packaged-extension
+acceptance.
+
+The [panel source and built JavaScript](openchamber/README.md) are included.
+Historical Mac acceptance included visual approval and installed host-route
+relay/removal, not UI-click automation or current platform certification. The
+relay keeps the Docket API token server-side, never in the iframe; the panel does
+not deliver wakes. Any installation is a separate principal-managed action.
+
+## Known limitations
+
+Do not run full test discovery, browser/CDP, e2e or evidence scripts: a browser
+updater escaped an earlier isolation attempt. Browser test sources remain for
+containment review. The historical browser-era suite was not green; no full-suite
+acceptance is claimed. This documentation authorizes no new live validation.
+
+Historical Mac acceptance and bounded Linux/Windows lifecycle evidence are not
+universal delivery guarantees. Real revocation remains unproven. The optional
+Pi route proves saved intake only, not execution, authentication, busy-steer
+integration or unattended availability; see its [specific limits](docs/pi.md).
+Codex and Claude Code existing-session wake parity is not established.
 
 ## License and artwork
 
