@@ -41,6 +41,7 @@ from docket.delivery import DeliveryError, Receipt
 from docket.parse import is_late, late_by_seconds, new_occurrence_id, wake_text
 from docket.store import Occurrence
 from docket.delivery_state import issue, project, retry_refusal
+from docket.checkins import Checkins
 
 LEASE_SECONDS = 60
 MAX_ATTEMPTS = 8
@@ -61,6 +62,8 @@ class Scheduler:
         self._gates: dict[str, threading.Lock] = {}
         self._gates_lock = threading.Lock()
         self._next_checks = {}
+        self.checkins = Checkins(self)
+        self._checkins_error = None
 
     def _gate(self, item_id):
         # Parent gate also serializes recurrence advancement and exact-unit recovery.
@@ -355,6 +358,11 @@ class Scheduler:
                 else:
                     self._fail(item, safe)
                 return True
+            # Fresh eligibility after preflight, before the irreversible send marker.
+            # Keep the core's frozen binding/body, dispatch certainty and gates intact.
+            if not self.checkins.allowed(item, self.clock.now()):
+                self.checkins.stop(item)
+                return True
             if not self.store.begin_send(unit.id, now):
                 return False
             self._enter_send(item.id, req["request_id"])
@@ -493,6 +501,12 @@ class Scheduler:
                     continue
                 if self._apply_watch_outcome(item, ready, self.clock.now()):
                     touched.append(item_id)
+        # Ordinary due work first; missing private roster leaves this opt-in off.
+        self.checkins.tick(self.clock.now())
+        if self.checkins.error != self._checkins_error:
+            self._checkins_error = self.checkins.error
+            if self.checkins.error:
+                _log(self.checkins.error)
         return touched
 
     def sending(self, item_id: str) -> bool:
@@ -668,6 +682,8 @@ class Scheduler:
         spec = dict(item.spec or {})
         if spec.get("open_occurrence_id"):
             return self._deliver_latched(item)
+        if self.checkins.marked(item):
+            outcome = self.checkins.evaluate(item, now)
         until = _parse(spec.get("until"))
         spec["checks"] = int(spec.get("checks") or 0) + 1
         if outcome.observations is not None:

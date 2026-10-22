@@ -221,6 +221,19 @@ prove Pi startup, unattended availability, authentication or model readiness.
 
 ## API, MCP and private state
 
+### Current work — 22 October 2026
+
+Opt-in [lead check-ins](LEAD_CHECKINS.md) add observed-idle and explicit-milestone
+nudges through bounded owned watches. Missing private roster means off; one-line
+hold/done controls and the existing four-eligible-pair capacity apply. Check-ins
+have source tests and a recorded macOS activation, but automatic consumed-wake
+proof remains pending; Windows/Linux check-in compatibility is not established.
+The accepted cross-platform core and Pi restrictions above are unchanged.
+
+Experimental [subscription intake, API/config and admission-state modules, plus
+the own-row milestone helper](docs/current-work.md), are **NON-LIVE / not wired**:
+no subscription sender, daemon route, native tool binding or automatic installation.
+
 API reads are local; mutations require the Docket bearer token. Metadata is at
 `GET /api/v1/meta`, with listings at `/api/v1/items` and `/api/v1/occurrences`.
 Pending listings include firing, admitted and ambiguous states. Lifecycle and
