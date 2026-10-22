@@ -262,6 +262,16 @@ class OpenCodeAdapter(DeliveryAdapter):
                 )
         return Validation.good()
 
+    def session_goal(self, session_id: str) -> dict:
+        """Read native goal metadata through the configured (including paired) adapter."""
+        status, body = self._request("GET", f"/api/session/{session_id}")
+        if status != 200 or not isinstance(body, dict):
+            raise DeliveryError("unavailable", "goal lookup unavailable", retryable=True)
+        data = body.get("data") or {}
+        if (data.get("time") or {}).get("archived"):
+            return {}
+        return ((data.get("metadata") or {}).get("openchamber") or {}).get("goal") or {}
+
     def session_state(self, session_id: str) -> str:
         """Return active, idle, missing, or archived.
 
