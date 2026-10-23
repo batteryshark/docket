@@ -39,6 +39,20 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8768
 MAX_BODY_BYTES = 65536
 BODY_READ_SECONDS = 5.0
+# Former event intake, inspection, and journal paths. They 404 before auth so a
+# leftover producer or channel credential cannot be checked or replay an admission.
+_RETIRED_EXACT = frozenset({"/api/v1/events", "/v1/actions/record"})
+
+
+def _retired_event_path(raw: str) -> bool:
+    path = urllib.parse.urlsplit(raw).path.rstrip("/") or "/"
+    return path in _RETIRED_EXACT or path.startswith("/api/v1/events/")
+
+
+def _raw_request_path(handler):
+    """Real HTTP requests have path. Direct handler fixtures supply _split instead."""
+    raw = getattr(handler, "path", None)
+    return raw if isinstance(raw, str) else None
 
 
 class DocketServer(ThreadingHTTPServer):
@@ -109,9 +123,14 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
+        raw = _raw_request_path(self)
+        if raw is not None and _retired_event_path(raw):
+            return self._error(404, "not_found", "no such path")
         if not self._boundary_ok():
             return self._error(403, "forbidden", "loopback only")
         path, query = self._split()
+        if raw is None and _retired_event_path(path):
+            return self._error(404, "not_found", "no such path")
         if "view" in query:
             return self._panel_read(path, query)
         if path == "/health":
@@ -186,11 +205,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not_found", "no such path")
 
     def do_POST(self):
+        raw = _raw_request_path(self)
+        if raw is not None and _retired_event_path(raw):
+            # Do not read a body or compare a bearer. Closing avoids turning the
+            # unread bytes into a following keep-alive request.
+            self.close_connection = True
+            return self._error(404, "not_found", "no such path")
         if not self._boundary_ok():
             return self._error(403, "forbidden", "loopback only")
         if not self._authed():
             return self._error(401, "unauthorized", "bearer token required")
         path, _query = self._split()
+        if raw is None and _retired_event_path(path):
+            self.close_connection = True
+            return self._error(404, "not_found", "no such path")
         body = self._body()
         if body is None:
             return

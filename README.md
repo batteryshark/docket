@@ -13,7 +13,9 @@ items; it does not deliver wakes. An optional [Pi companion adapter](docs/pi.md)
 targets an existing persistent Pi recipient, with saved-intake-only evidence.
 Opt-in Tower notices for fires and new delivery-stall episodes stay off unless
 `$DOCKET_TOWER_NATS_URL` is a numeric loopback URL; see [Tower notices](docs/TOWER.md).
-That notice does not change delivery, Pi intake, or the limits below.
+That notice does not change delivery, Pi intake, or the limits below. Event
+intake belongs to [Tower](https://github.com/batteryshark/tower); see
+[clock-only split](docs/CLOCK_ONLY.md).
 
 ## Why use Docket?
 
@@ -112,7 +114,7 @@ different Python selected from PATH.
 - Items cannot execute commands or scripts. Context is data, not instructions.
   Ordinary schedules neither reserve model quotas nor dispatch arbitrary worker
   processes or contact the operator directly. A woken agent may act on its own
-  instructions; opt-in event handlers have separate installed bounds below.
+  instructions.
 - Pi selection is explicit per target: `--adapter pi --session pi/<id>`.
   Default OpenCode/paired delivery is unchanged, with no Pi fallback. Read the
   [Pi setup and restrictions](docs/pi.md) first; Pi does not support directory
@@ -223,39 +225,20 @@ Windows OS reboot was **not separately tested**. These are bounded demonstration
 not universal availability or task-execution guarantees. Pi saved intake does not
 prove Pi startup, unattended availability, authentication or model readiness.
 
-## Opt-in event delivery
+## Clock-only architecture and split
 
-Authenticated event intake now feeds a durable subscription queue with dedupe,
-bounded backoff, dead letters and inspection. Installed versioned profiles can
-only narrow an installed native baseline: identity, tools, authority, secrets
-references, model and budget are operator configuration, never event-selected.
-Event fields are bounded, delimited data, not instructions. Actions can wake an
-explicitly provisioned existing owner or run a fresh scoped handler with
-revoke-first automatic cleanup. Enrollment requires an actual installed native
-baseline, role, goal and hooks; it does not attach to existing principal leads.
+Docket schedules timers, alarms, recurring schedules, watches, and check-ins/stall
+attention, and publishes best-effort notices. Event intake, routing, and handling
+belong to [Tower](https://github.com/batteryshark/tower). Event intake, subscription
+queues, wake profiles, sandbox runners, and event outcome journaling are not Docket
+capabilities.
 
-See [native profiles and operator setup](integrations/opencode/README.md),
-[handler requirements](integrations/opencode/sandbox-runtime.md) and the
-[write-only journal](integrations/toolstack/event-journal/README.md). Events are
-off unless explicit private configs are supplied; ordinary schedules are unchanged.
-Inspection uses the existing admin bearer, not the publisher/channel credential:
-
-```sh
-python3 -m docket events list --json
-python3 -m docket events deadletters --json
-python3 -m docket events inspect evd_… --json
-python3 -m docket events outcomes --json
-```
-
-Both native actions and handler token/caller revocation and pruning were exercised;
-the normal live scheduler also completed one journal-only handler. The exercised
-hard-cap route is `xai/grok-4.7` over HTTP. The installed live class only records
-a bounded journal summary. The native handler backend requires macOS Seatbelt,
-Fleet and compatible OpenCode; this is not universal provider/platform support.
-Real Tool Stack/Nod pending/refusal contracts are proved, not a principal approval.
-Risky capabilities require separately authorized installed scopes and real review;
-missing approval machinery fails closed. The scoped own-milestone helper is also
-native-bound; it does not grant generic roster writes or reenrollment.
+Clock-only startup leaves legacy event tables/data and private configuration
+untouched; it does not drop, drain or replay them. A consistent pre-cut backup is
+retained by the operator. Prior event-intake and sandbox-runtime code is preserved
+at the public retention reference
+[event-runtime-before-clock-cut-20261023](https://github.com/batteryshark/docket/tree/event-runtime-before-clock-cut-20261023)
+for later agent launch profiles. See [docs/CLOCK_ONLY.md](docs/CLOCK_ONLY.md).
 
 ## API, MCP and private state
 
@@ -268,10 +251,10 @@ have source tests and a recorded macOS activation, but automatic consumed-wake
 proof remains pending; Windows/Linux check-in compatibility is not established.
 The accepted cross-platform core and Pi restrictions above are unchanged.
 
-[Subscription intake, API/config, admission/worker and native runtime modules,
-plus the scoped own-row milestone helper](docs/current-work.md), are now wired
-through explicit opt-in configuration and native bindings. Publishing source does
-not install those configs, enroll owners or automatically enable delivery.
+The [clock-only split](docs/current-work.md) removes event intake from Docket and
+points event-driven work at Tower. The public retention tag keeps the prior
+runtime for later launch profiles. Publishing source does not install
+configuration, enroll owners, drop legacy event tables, or enable delivery.
 
 API reads are local; mutations require the Docket bearer token. Metadata is at
 `GET /api/v1/meta`, with listings at `/api/v1/items` and `/api/v1/occurrences`.
