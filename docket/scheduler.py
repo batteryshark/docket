@@ -42,6 +42,7 @@ from docket.parse import is_late, late_by_seconds, new_occurrence_id, wake_text
 from docket.store import Occurrence
 from docket.delivery_state import issue, project, retry_refusal
 from docket.checkins import Checkins
+from docket.tower_publish import TowerPublisher
 
 LEASE_SECONDS = 60
 MAX_ATTEMPTS = 8
@@ -65,6 +66,7 @@ class Scheduler:
         self.checkins = Checkins(self)
         self._checkins_error = None
         self.event_worker = event_worker
+        self.tower = TowerPublisher()
 
     def _gate(self, item_id):
         # Parent gate also serializes recurrence advancement and exact-unit recovery.
@@ -342,6 +344,7 @@ class Scheduler:
                     self.store.invalidate_binding(unit.id)
                     raise DeliveryError("backend_unverifiable")
                 if req["stop_requested"] or not req["frozen"]:
+                    self._note_tower_fire(item, occ)
                     return False
                 validate = getattr(adapter, "validate_frozen", None)
                 check = validate(req["frozen"]) if callable(validate) else adapter.validate(req["frozen"]["target"])
@@ -358,13 +361,16 @@ class Scheduler:
                     self._fail_occurrence(item, occ, safe)
                 else:
                     self._fail(item, safe)
+                self._note_tower_fire(item, occ)
                 return True
             # Fresh eligibility after preflight, before the irreversible send marker.
             # Keep the core's frozen binding/body, dispatch certainty and gates intact.
             if not self.checkins.allowed(item, self.clock.now()):
                 self.checkins.stop(item)
+                self._note_tower_fire(item, occ)
                 return True
             if not self.store.begin_send(unit.id, now):
+                self._note_tower_fire(item, occ)
                 return False
             self._enter_send(item.id, req["request_id"])
             try:
@@ -398,6 +404,7 @@ class Scheduler:
                 self._ambiguous(item, occ, req["request_id"], issue(code)["detail"])
             finally:
                 self._leave_send(item.id)
+            self._note_tower_fire(item, occ)
             return True
         finally:
             gate.release()
@@ -1142,6 +1149,35 @@ class Scheduler:
         if firing_at is None:
             return False
         return _utc(firing_at) > _utc(now) - timedelta(seconds=LEASE_SECONDS)
+
+    def _note_tower_fire(self, item, occ) -> None:
+        """Enqueue one fire notice. Receipt, admission, and cancel are untouched."""
+        try:
+            fresh = self.store.get(item.id)
+            if fresh is None or fresh.status == "cancelled":
+                return
+            fresh_occ = None
+            if occ is not None:
+                fresh_occ = self.store.get_occurrence(occ.id)
+                if fresh_occ is None or fresh_occ.status == "cancelled":
+                    return
+            status = fresh_occ.status if fresh_occ is not None else fresh.status
+            # Still firing: the attempt did not settle. Cancelled intent is not a fire.
+            if status in ("cancelled", "firing"):
+                return
+            self.tower.note_fire(fresh, fresh_occ, _tower_outcome(status), self.clock.now())
+        except Exception:
+            return
+
+
+def _tower_outcome(status: str) -> str | None:
+    return {
+        "delivered": "consumed",
+        "admitted": "admitted",
+        "undeliverable": "undeliverable",
+        "ambiguous": "ambiguous",
+        "pending": "retry",
+    }.get(status)
 
 
 def log_scheduler_error(exc: BaseException) -> None:

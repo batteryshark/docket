@@ -11,6 +11,9 @@ Windows. The Unix core uses the standard library; Windows also requires
 `tzlocal>=5.0` and `tzdata`. An optional OpenChamber panel lists and removes
 items; it does not deliver wakes. An optional [Pi companion adapter](docs/pi.md)
 targets an existing persistent Pi recipient, with saved-intake-only evidence.
+Opt-in Tower notices for fires and new delivery-stall episodes stay off unless
+`$DOCKET_TOWER_NATS_URL` is a numeric loopback URL; see [Tower notices](docs/TOWER.md).
+That notice does not change delivery, Pi intake, or the limits below.
 
 ## Why use Docket?
 
