@@ -58,8 +58,9 @@ This detects observed conflicts, not arbitrary noncooperating-writer CAS.
 
 The native `docket_milestone` wrapper binds identity and permits only the caller's
 two milestone fields, never state, enrollment or another row. Hold/resume remains
-an explicitly authorized operator edit; it must not replay a milestone. See the
-[native binding contract](integrations/opencode/README.md#existing-own-milestone-tool).
+an explicitly authorized operator edit; it must not replay a milestone. Callers
+are bound to matching native session and directory under flock; generic roster writes
+or reenrollment are refused.
 
 ## Eligibility and timing
 
