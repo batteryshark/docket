@@ -193,7 +193,8 @@ class SubscriptionHTTPTests(unittest.TestCase):
         commit = self.store._commit
         def committed_then_error():
             commit()
-            raise OSError("fixture lost confirmation")
+            if self.count():
+                raise OSError("fixture lost confirmation")
         with patch.object(self.store, "_commit", side_effect=committed_then_error):
             self.assertEqual(self.request()[0], 503)
         self.assertEqual(self.count(), 1)

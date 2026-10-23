@@ -50,7 +50,7 @@ OPEN = ("pending", "firing", "admitted", "ambiguous")
 
 
 class Scheduler:
-    def __init__(self, store, adapter, clock, checks=None, check_executor=None, *, pi_adapter=None):
+    def __init__(self, store, adapter, clock, checks=None, check_executor=None, *, pi_adapter=None, event_worker=None):
         self.store = store
         self.adapter = adapter
         self._pi_adapter = pi_adapter
@@ -64,6 +64,7 @@ class Scheduler:
         self._next_checks = {}
         self.checkins = Checkins(self)
         self._checkins_error = None
+        self.event_worker = event_worker
 
     def _gate(self, item_id):
         # Parent gate also serializes recurrence advancement and exact-unit recovery.
@@ -507,6 +508,11 @@ class Scheduler:
             self._checkins_error = self.checkins.error
             if self.checkins.error:
                 _log(self.checkins.error)
+        if self.event_worker is not None:
+            try:
+                touched.extend(self.event_worker.scheduler_tick(self.clock.now()))
+            except Exception:
+                _log("event worker unavailable; retained durable state")
         return touched
 
     def sending(self, item_id: str) -> bool:

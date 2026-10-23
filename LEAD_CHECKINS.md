@@ -46,6 +46,21 @@ Both check-ins use the fixed `lead-checkins` setter: **four eligible idle leads
 with two watch slots each fit**; ordinary watches may reduce available capacity.
 Excess waits for capacity; a scheduler diagnostic says capacity was reached.
 
+### Cooperating roster writers
+
+Serialize trusted roster edits with the existing owned0600
+`.lead-checkins.lock` beside the roster (`flock`, exclusive/nonblocking). Follow
+`docket/milestone.py`: validate private owned directory/file and unique rows,
+retain expected bytes and file identity, prepare a metadata-preserving temporary
+file in the same directory, fsync it, re-read/revalidate the original and parent,
+then atomically replace and fsync the directory. Preserve unrelated bytes/fields.
+This detects observed conflicts, not arbitrary noncooperating-writer CAS.
+
+The native `docket_milestone` wrapper binds identity and permits only the caller's
+two milestone fields, never state, enrollment or another row. Hold/resume remains
+an explicitly authorized operator edit; it must not replay a milestone. See the
+[native binding contract](integrations/opencode/README.md#existing-own-milestone-tool).
+
 ## Eligibility and timing
 
 Only roster `active` + host goal `active` or `blocked` is unfinished. `complete`,

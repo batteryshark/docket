@@ -337,7 +337,7 @@ class ProcessTests(unittest.TestCase):
                     updated_at=now,
                     reason=item_id,
                     context={},
-                    target={'adapter': 'fake', 'session_id': 'ses_knownsession0001'},
+                    target={'adapter': 'opencode', 'session_id': 'ses_knownsession0001'},
                     urgent=False,
                     created_by=None,
                     late=False,

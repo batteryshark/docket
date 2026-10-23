@@ -107,8 +107,9 @@ different Python selected from PATH.
   wrong-location targets are refused or become undeliverable. An unreadable
   archive overlay is unavailable, not an empty archive.
 - Items cannot execute commands or scripts. Context is data, not instructions.
-  Docket neither reserves model quotas nor dispatches arbitrary worker processes
-  or contacts the operator directly. A woken agent may act on its own instructions.
+  Ordinary schedules neither reserve model quotas nor dispatch arbitrary worker
+  processes or contact the operator directly. A woken agent may act on its own
+  instructions; opt-in event handlers have separate installed bounds below.
 - Pi selection is explicit per target: `--adapter pi --session pi/<id>`.
   Default OpenCode/paired delivery is unchanged, with no Pi fallback. Read the
   [Pi setup and restrictions](docs/pi.md) first; Pi does not support directory
@@ -219,6 +220,40 @@ Windows OS reboot was **not separately tested**. These are bounded demonstration
 not universal availability or task-execution guarantees. Pi saved intake does not
 prove Pi startup, unattended availability, authentication or model readiness.
 
+## Opt-in event delivery
+
+Authenticated event intake now feeds a durable subscription queue with dedupe,
+bounded backoff, dead letters and inspection. Installed versioned profiles can
+only narrow an installed native baseline: identity, tools, authority, secrets
+references, model and budget are operator configuration, never event-selected.
+Event fields are bounded, delimited data, not instructions. Actions can wake an
+explicitly provisioned existing owner or run a fresh scoped handler with
+revoke-first automatic cleanup. Enrollment requires an actual installed native
+baseline, role, goal and hooks; it does not attach to existing principal leads.
+
+See [native profiles and operator setup](integrations/opencode/README.md),
+[handler requirements](integrations/opencode/sandbox-runtime.md) and the
+[write-only journal](integrations/toolstack/event-journal/README.md). Events are
+off unless explicit private configs are supplied; ordinary schedules are unchanged.
+Inspection uses the existing admin bearer, not the publisher/channel credential:
+
+```sh
+python3 -m docket events list --json
+python3 -m docket events deadletters --json
+python3 -m docket events inspect evd_… --json
+python3 -m docket events outcomes --json
+```
+
+Both native actions and handler token/caller revocation and pruning were exercised;
+the normal live scheduler also completed one journal-only handler. The exercised
+hard-cap route is `xai/grok-4.7` over HTTP. The installed live class only records
+a bounded journal summary. The native handler backend requires macOS Seatbelt,
+Fleet and compatible OpenCode; this is not universal provider/platform support.
+Real Tool Stack/Nod pending/refusal contracts are proved, not a principal approval.
+Risky capabilities require separately authorized installed scopes and real review;
+missing approval machinery fails closed. The scoped own-milestone helper is also
+native-bound; it does not grant generic roster writes or reenrollment.
+
 ## API, MCP and private state
 
 ### Current work — 22 October 2026
@@ -230,9 +265,10 @@ have source tests and a recorded macOS activation, but automatic consumed-wake
 proof remains pending; Windows/Linux check-in compatibility is not established.
 The accepted cross-platform core and Pi restrictions above are unchanged.
 
-Experimental [subscription intake, API/config and admission-state modules, plus
-the own-row milestone helper](docs/current-work.md), are **NON-LIVE / not wired**:
-no subscription sender, daemon route, native tool binding or automatic installation.
+[Subscription intake, API/config, admission/worker and native runtime modules,
+plus the scoped own-row milestone helper](docs/current-work.md), are now wired
+through explicit opt-in configuration and native bindings. Publishing source does
+not install those configs, enroll owners or automatically enable delivery.
 
 API reads are local; mutations require the Docket bearer token. Metadata is at
 `GET /api/v1/meta`, with listings at `/api/v1/items` and `/api/v1/occurrences`.

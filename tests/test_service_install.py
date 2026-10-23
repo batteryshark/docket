@@ -110,7 +110,7 @@ class InstallTests(unittest.TestCase):
 
     def test_resolved_state_keeps_existing_contents_in_place(self):
         state = self.home / 'actual state & <雪'
-        state.mkdir()
+        state.mkdir(mode=0o700)
         sentinel = state / 'existing-state'
         sentinel.write_bytes(b'unchanged state fixture')
         alias = self.home / 'state alias'
