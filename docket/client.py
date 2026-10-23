@@ -57,10 +57,8 @@ def request(method: str, path: str, body: dict | None = None, *, timeout: float 
     url = resolve_url() + path
     data = None if body is None else json.dumps(body).encode()
     headers = {"Accept": "application/json"}
-    event_inspection = path == "/api/v1/events" or path.startswith("/api/v1/events/")
-    if method != "GET" or event_inspection:
-        headers["Authorization"] = "Bearer " + resolve_token()
     if method != "GET":
+        headers["Authorization"] = "Bearer " + resolve_token()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:

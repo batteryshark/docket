@@ -1,6 +1,6 @@
 # Tower notices
 
-Docket can publish two CloudEvents to the Tower bus. This is off unless
+Docket can publish two CloudEvents to the [Tower](https://github.com/batteryshark/tower) bus. This is off unless
 `DOCKET_TOWER_NATS_URL` is set, so existing installs and tests do not connect,
 read a token, or enqueue anything. Setting the variable is a later operator
 step; this document does not enable it.
