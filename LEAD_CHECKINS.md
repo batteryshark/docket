@@ -82,10 +82,10 @@ and message activity are never visible milestones. Explicit hold/done always win
   get a fresh bounded watch while still eligible, preserving the milestone
   baseline. This continues beyond today; no cron/daemon renewal is needed.
 
-Prompts ask the **lead** to tell the chief in one plain sentence. This feature
-does not message any chief ID and never routes through retired Ops. Any later
-chief-directed operation must resolve the operator's current intended recipient;
-no recipient identity is bundled here.
+Idle/milestone prompts ask the **lead** to tell the chief in one plain sentence.
+They do not message any chief ID and never route through retired Ops. The separate
+delivery-stall inbox lane resolves the operator's current intended recipient via
+`~/.chief-of-staff/chief.json`; no recipient identity is bundled here.
 
 ## Cancellation, uncertainty and recovery
 
@@ -108,6 +108,73 @@ requires owner inspection, not blind deletion. Do not reset the ledger to
 silence a fault: inspect the owned IDs and existing receipts/inbox first, prove
 the prior intent consumed/stopped, then repair that specific private slot.
 There is no new automated recovery protocol.
+
+## RUNNING / no-delivery inbox lane
+
+The same minute tick runs this independent lane after ordinary reconciliation.
+Only roster active + native goal active + session active + validated absolute
+directory and `(id, createdAt)` qualify. Blocked, held, done, idle, archived,
+moved and unknown sessions suppress. Restart, failed observations, backward
+clock movement and gaps over two minutes restart the continuous running interval.
+At 30 observed minutes without a fingerprint change, reserve one deterministic
+alert per session/directory/native-goal delivery epoch in the existing ledger's
+additive `delivery_stalls` map. Idle gaps, milestones and chief replacement do
+not rearm it. Content change rearms; activity, counters and milestones do not.
+
+`docket.delivery_evidence.snapshot` supplies bounded source/content observations.
+Optional roster `delivery_artifacts` is a list of at most 16 absolute paths, each
+at most 4096 characters and without NULs. Invalid configuration or unavailable
+evidence suppresses this lane. Configuration changes rebaseline conservatively,
+without counting as delivery or rearming an alerted epoch. No trusted installation
+receipts exist. Content observations cannot attribute work to one writer, establish
+acceptance, or prove installation success. The first observation is a baseline,
+not a claim that anything was delivered. Usable/remaining text is factual evidence
+and chief review scope, never a project forecast or quota estimate.
+
+Reader coverage is the enrolled Git root plus up to eight registered descendant
+worktrees of the same repository. Aggregate two-pass bounds are 10 seconds,
+16 MiB of content, 2 MiB of Git output and 2048 enumerated file entries. Source
+text comparison is whitespace-insensitive; logs, LEAD files, private/generated
+files and ignored untracked files are excluded. Configured artifacts are compared
+by exact bytes, not mtime. Non-Git directories require explicit regular artifact
+files: this is selected-file coverage, not whole-project coverage. Other lane
+writes may be missed. An unchanged observation is an attention flag, not proof
+of failure or of no useful work.
+
+Each publication freshly resolves `~/.chief-of-staff/chief.json` (`session`,
+absolute `directory`). Pointer and destination must be owned, not symlinks, and
+not group/other writable; existing read/execute bits are allowed. Roster/ledger
+privacy rules remain unchanged. The destination is only that directory's `inbox`.
+New alert files are 0600, fsynced and atomically linked without overwrite to
+`delivery-stall-<deterministic-key>.md`. No wake, resume, principal card, bus,
+service or new scheduler is involved. Per-tick probes are bounded by the existing
+20-row roster and the evidence reader's bounds; ordinary due work runs first.
+
+Fresh pointer/destination validation precedes reservation. Known pre-reservation
+refusals remain retryable. The ledger then freezes the alert text, key, chief
+session/directory and inbox device/inode before publication. Uncertain writes
+retry only that exact inbox and deterministic file; matching existing bytes
+reconcile success, conflicts or replaced inboxes suppress with a diagnostic.
+A crash after linking but before ledger completion cannot replay into a replacement
+chief. Residual limits: a crash can leave an unlinked private temporary file;
+lost ledger durability, filesystem inode reuse or external deletion of the alert
+cannot establish exactly-once delivery. Do not delete the ledger. Frozen destination
+failures require owner inspection, not redirection to a new chief.
+Bounded generic diagnostics surface through `Checkins.error`; ordinary ineligibility
+does not report a failure. Evidence/inbox failures cannot disable old checks.
+Evidence filesystem reads use the existing bounded check executor's submit/take,
+never wait or create a new pool. Pending results cannot advance continuity.
+Queue the next frozen probe immediately after consuming a successful result,
+keeping steady-state sampling at one cadence despite drift. Results older than
+two minutes or probes taking over two minutes are discarded. Hold,
+goal/directory/config changes invalidate pending results; completed observations
+alone count toward the interval. The evidence reader's optional opaque scope
+detects source-root/artifact topology changes: these rebaseline without rearming.
+No roster state is edited here. Coverage always follows the current roster and
+native eligibility, not a cached report of which projects were active or held.
+Isolated policy tests inject the reader and writer. Operational installation and
+actual-use readback are recorded separately by the runtime owner. This lane never
+changes native lead models, goals or accepted markers, and never notifies the principal.
 
 ## Source installation (not performed by this change)
 

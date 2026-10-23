@@ -98,6 +98,8 @@ class Checkins:
             self.state = {"leads": {}, "owned": {}}
         for lead in self.state["leads"].values():
             lead["idle_since"] = None  # never infer continuous idle across restart
+        from docket.delivery_stall import DeliveryStall
+        self.delivery_stall = DeliveryStall(self)
 
     def save(self):
         # Reserve intent before inserting a watch. A crash may lose a nudge,
@@ -206,6 +208,15 @@ class Checkins:
             # No file contents, session metadata or credentials in diagnostics.
             self.error = "check-in reconciliation unavailable; dispatch suppressed"
             self.broken = True
+
+        if not self.broken:
+            try:
+                self.delivery_stall.tick(now)
+            except Exception:
+                self.delivery_stall.samples.clear()
+                self.delivery_stall.error = "delivery-stall ledger unavailable; publication suppressed"
+            if self.delivery_stall.error:
+                self.error = "; ".join(filter(None, (self.error, self.delivery_stall.error)))
 
     def reconcile(self, now):
         try:
