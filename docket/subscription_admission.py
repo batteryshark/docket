@@ -1,8 +1,8 @@
-"""NON-LIVE admission state contract. No deliver(), resume(), or scheduler wiring.
+"""Admission state contract; the opt-in event worker owns adapter invocation.
 
 Existing DeliveryAdapter.reconcile/Receipt shapes are reused. The existing host's
 deliver(resume=True) cannot enforce atomic stop precedence/profile narrowing, so
-this module deliberately cannot send. Trusted snapshots below are candidate
+this module deliberately cannot send. Trusted snapshots below are local
 preconditions, NOT a host fence. All mutation methods are internal adapter seams,
 never producer HTTP operations. Only explicit construction installs these tables.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import secrets
+import hashlib
 
 from docket.delivery import Receipt
 from docket.subscriptions import SubscriptionRefusal, SubscriptionStore, _json
@@ -26,6 +27,10 @@ CREATE TABLE IF NOT EXISTS subscription_admission_history (
  sequence INTEGER PRIMARY KEY, delivery_id TEXT NOT NULL,
  generation TEXT NOT NULL, phase TEXT NOT NULL, blocked INTEGER NOT NULL,
  reason TEXT NOT NULL, at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscription_handler_terminals (
+ delivery_id TEXT PRIMARY KEY, generation TEXT NOT NULL,
+ receipt_json TEXT NOT NULL, recorded_at TEXT NOT NULL
 );
 """
 BINDING_KEYS = ("target", "owner_generation", "profile_id", "profile_version",
@@ -101,6 +106,39 @@ class AdmissionStore(SubscriptionStore):
         with self._lock:
             return self._public(self._row(delivery_id))
 
+    def handler_terminal(self, delivery_id):
+        """Separate trusted terminal evidence; plain consumption is not finish."""
+        with self._lock:
+            row = self._db.execute("SELECT receipt_json FROM subscription_handler_terminals WHERE delivery_id=?", (delivery_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    @staticmethod
+    def _terminal_proof(row, receipt):
+        prepared = json.loads(row["binding_json"])
+        proof = receipt.raw.get("handler_terminal") if isinstance(receipt.raw, dict) else None
+        if prepared.get("action") != "handler" or not isinstance(proof, dict):
+            return None
+        terminal = proof.get("native_terminal")
+        if (not isinstance(terminal, dict) or proof.get("phase") != "pruned"
+                or proof.get("consumed") is not True or proof.get("trusted_completion") is not True
+                or proof.get("delivery_id") != row["delivery_id"]
+                or proof.get("admission_id") != row["admission_id"] or proof.get("generation") != row["generation"]
+                or not isinstance(proof.get("environment_id"), str) or not proof["environment_id"]
+                or not isinstance(proof.get("session_id"), str) or not proof["session_id"].startswith("ses_")
+                or terminal.get("session_id") != proof["session_id"]
+                or terminal.get("admission_id") != row["admission_id"]
+                or terminal.get("body_sha256") != hashlib.sha256(prepared["briefing"].encode()).hexdigest()
+                or not isinstance(terminal.get("terminal_id"), str) or not terminal["terminal_id"].startswith("msg_")
+                or terminal.get("outcome") not in ("succeeded", "failed", "interrupted")
+                or terminal.get("not_active") is not True or terminal.get("empty_inbox") is not True
+                or not isinstance(proof.get("output_manifest"), list)):
+            return None
+        # Explicit evidence projection: never save a raw grant or host error.
+        return {**{key: proof[key] for key in ("delivery_id", "admission_id", "generation", "environment_id", "session_id",
+                  "phase", "consumed", "trusted_completion", "output_manifest")},
+                "native_terminal": {key: terminal[key] for key in ("session_id", "admission_id", "body_sha256",
+                  "terminal_id", "outcome", "not_active", "empty_inbox")}}
+
     def _change(self, row, phase, reason, *, blocked=None):
         blocked = row["blocked"] if blocked is None else int(blocked)
         if (row["phase"], row["reason"], row["blocked"]) == (phase, reason, blocked):
@@ -114,7 +152,7 @@ class AdmissionStore(SubscriptionStore):
             self._db.execute("UPDATE subscription_deliveries SET status='admitted' WHERE id=?",
                              (row["delivery_id"],))
 
-    def record_send_intent(self, delivery_id, generation, *, trusted_snapshot):
+    def record_send_intent(self, delivery_id, generation, *, trusted_snapshot, claim_guard=None):
         """Local crash-point contract only, NOT execution permission.
 
         claimed is true once. No send implementation exists here. A future fenced
@@ -130,7 +168,7 @@ class AdmissionStore(SubscriptionStore):
                 reason = "prepared binding changed"
             if reason:
                 self._change(row, row["phase"], reason, blocked=True)
-            elif not row["blocked"] and row["phase"] == "ready":
+            elif not row["blocked"] and row["phase"] == "ready" and (claim_guard is None or claim_guard()):
                 self._change(row, "sending", "send intent only; external admission not established")
                 claimed = True
             return {**self._public(self._row(delivery_id)), "claimed": claimed,
@@ -140,17 +178,30 @@ class AdmissionStore(SubscriptionStore):
         """Record trusted adapter evidence, not event-supplied success prose."""
         with self._transaction():
             row = self._row(delivery_id, generation)
-            if row["phase"] == "consumed":
+            handler_finished = isinstance(receipt, Receipt) and receipt.state == "handler_finished"
+            if row["phase"] == "consumed" and not handler_finished:
                 return self._public(row)
-            if row["phase"] not in ("sending", "uncertain", "admitted"):
+            if row["phase"] not in ("sending", "uncertain", "admitted", "consumed"):
                 raise SubscriptionRefusal("no matching send intent", code="conflict")
             valid = (isinstance(receipt, Receipt) and receipt.admission_id == row["admission_id"]
                      and receipt.inbox_id == row["admission_id"] and receipt.delivery == "queue"
-                     and receipt.state == "admitted" and type(receipt.consumed) is bool)
+                     and receipt.state in ("admitted", "consumed", "handler_finished") and type(receipt.consumed) is bool
+                     and (receipt.state == "admitted" or receipt.consumed))
+            proof = self._terminal_proof(row, receipt) if valid and handler_finished else None
+            if handler_finished:
+                valid = valid and proof is not None
+            if valid and handler_finished:
+                encoded = _json(proof)
+                old = self._db.execute("SELECT receipt_json FROM subscription_handler_terminals WHERE delivery_id=?", (delivery_id,)).fetchone()
+                if old and old[0] != encoded:
+                    raise SubscriptionRefusal("handler terminal evidence conflict", code="conflict")
+                self._db.execute("INSERT OR IGNORE INTO subscription_handler_terminals VALUES (?,?,?,?)",
+                                 (delivery_id, generation, encoded, datetime.now(timezone.utc).isoformat()))
             if valid:
-                self._change(row, "consumed" if receipt.consumed else "admitted", "exact adapter receipt")
+                self._change(row, "consumed" if receipt.consumed else "admitted",
+                             "exact handler terminal receipt" if handler_finished else "exact adapter receipt")
             else:
-                self._change(row, row["phase"] if row["phase"] == "admitted" else "uncertain",
+                self._change(row, row["phase"] if row["phase"] in ("admitted", "consumed") else "uncertain",
                              "invalid or mismatched adapter receipt")
             return self._public(self._row(delivery_id))
 

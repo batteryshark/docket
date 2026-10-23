@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 import urllib.parse
 
@@ -36,6 +37,21 @@ def main(argv: list[str] | None = None) -> int:
     daemon = sub.add_parser("daemon", help="run the service for launchd")
     daemon.add_argument("--host", default="127.0.0.1")
     daemon.add_argument("--port", type=int, default=8768)
+    for command in (serve, daemon):
+        command.add_argument("--events-config", help="explicit private v2 subscription manifest; enables event intake/worker")
+        command.add_argument("--event-host-config", help="explicit private native event-host config (required with events)")
+        command.add_argument("--event-journal-config", help="explicit private write-only journal channel config (requires events)")
+
+    events = sub.add_parser("events", help="inspect durable event deliveries or install trusted configuration")
+    event_commands = events.add_subparsers(dest="event_command", required=True)
+    for name in ("list", "deadletters", "inspect", "outcomes"):
+        command = event_commands.add_parser(name)
+        command.add_argument("--json", action="store_true")
+        if name == "inspect":
+            command.add_argument("id")
+    install = event_commands.add_parser("install", help="offline operator-only immutable manifest installation")
+    install.add_argument("--config", required=True, help="absolute private manifest path")
+    install.add_argument("--database", required=True, help="explicit absolute Docket database path")
 
     timer = sub.add_parser("timer", help="set a relative timer")
     _common(timer)
@@ -112,7 +128,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result))
             return 0
         if args.command in ("serve", "daemon"):
-            return _serve(args.host, args.port)
+            return _serve(args.host, args.port, events_config=args.events_config, event_host_config=args.event_host_config,
+                          event_journal_config=args.event_journal_config)
+        if args.command == "events":
+            return _events(args)
         if args.command == "timer":
             return _create("timer", args)
         if args.command == "alarm":
@@ -164,7 +183,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
-def _serve(host: str, port: int) -> int:
+def _serve(host: str, port: int, *, events_config=None, event_host_config=None, event_journal_config=None) -> int:
     from docket.api import DocketServer
     from docket.clock import SystemClock
     from docket.host import configured_adapter
@@ -176,10 +195,45 @@ def _serve(host: str, port: int) -> int:
         print("docket: refusing to bind a non-loopback address", file=sys.stderr)
         return 1
     root = home()
-    store = Store(root / "docket.db")
-    server = DocketServer(
-        store, Scheduler(store, configured_adapter(archive=OpenChamberArchive()), SystemClock()),
-        load_token(), host, port,
+    if bool(events_config) != bool(event_host_config):
+        print("docket: events require both explicit private config paths", file=sys.stderr)
+        return 1
+    if event_journal_config and not events_config:
+        print("docket: journal requires explicit event configuration", file=sys.stderr)
+        return 1
+    event_worker = None
+    server_type = DocketServer
+    options = {}
+    if events_config:
+        from docket.subscription_api import SubscriptionServer, read_private_json
+        from docket.subscription_worker import EventStore, EventWorker
+        from docket.subscriptions import SubscriptionRefusal
+        store = None
+        try:
+            manifest = read_private_json(events_config)
+            if not isinstance(manifest, dict) or manifest.get("version") != 2:
+                raise SubscriptionRefusal("live event mode requires native version 2 profiles")
+            host_config = read_private_json(event_host_config)
+            from docket.event_host import configured_event_adapter
+            event_adapter = configured_event_adapter(host_config)
+            store = EventStore(root / "docket.db")
+            store.install_manifest(manifest)
+            event_worker = EventWorker(store, event_adapter)
+            if event_journal_config:
+                from docket.event_journal import EventJournal
+                options["journal"] = EventJournal(store.path.resolve(), event_journal_config)
+        except (ValueError, TypeError, OSError, ImportError, sqlite3.Error):
+            if store is not None:
+                store.close()
+            print("docket: native event configuration unavailable or refused", file=sys.stderr)
+            return 1
+        server_type = SubscriptionServer
+        options["enabled"] = True
+    else:
+        store = Store(root / "docket.db")
+    server = server_type(
+        store, Scheduler(store, configured_adapter(archive=OpenChamberArchive()), SystemClock(), event_worker=event_worker),
+        load_token(), host, port, **options,
     )
     info = {"url": server.url, "pid": _pid()}
     path = server_path()
@@ -192,11 +246,53 @@ def _serve(host: str, port: int) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server._sched_stop.set()
+        worker_stopped = event_worker is None or event_worker.close()
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        store.close()
+        if worker_stopped:
+            store.close()
+        else:
+            print("docket: event worker shutdown unresolved; durable intent retained", file=sys.stderr)
+    return 0
+
+
+def _events(args):
+    if args.event_command == "install":
+        from pathlib import Path
+        from docket.subscription_api import load_installed
+        from docket.subscription_worker import EventStore
+        if not Path(args.database).is_absolute():
+            print("docket: installation requires an explicit absolute database path", file=sys.stderr)
+            return 1
+        store = None
+        try:
+            store = EventStore(Path(args.database))
+            load_installed(store, Path(args.config))
+        except (ValueError, TypeError, OSError, sqlite3.Error):
+            print("docket: trusted event installation refused", file=sys.stderr)
+            return 1
+        finally:
+            if store is not None:
+                store.close()
+        print("docket: immutable event configuration installed; daemon activation is separate")
+        return 0
+    from urllib.parse import quote
+    path = "/api/v1/events"
+    if args.event_command == "deadletters":
+        path += "/deadletters"
+    elif args.event_command == "outcomes":
+        path += "/outcomes"
+    elif args.event_command == "inspect":
+        path += "/" + quote(args.id, safe="")
+    _, payload = request("GET", path)
+    if args.json or args.event_command in ("inspect", "outcomes"):
+        print(json.dumps(payload, indent=None if args.json else 2))
+    else:
+        for row in payload.get("events", []):
+            print(f"{row['id']}  {row.get('terminal') or row.get('phase') or row['status']}  {row.get('reason') or ''}")
     return 0
 
 

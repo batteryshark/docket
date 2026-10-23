@@ -1,4 +1,4 @@
-"""NON-LIVE subscription intake candidate; not loaded by daemon/API/scheduler.
+"""Durable subscription intake, enabled only by explicit daemon configuration.
 
 Installed configuration is trusted operator input. Events are bounded data only.
 Shares Store's SQLite/lock/private-file discipline, but never creates an Item or
@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS subscription_deliveries (
 );
 CREATE TABLE IF NOT EXISTS subscription_installation (
   slot INTEGER PRIMARY KEY CHECK(slot=1), manifest_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscription_rate_windows (
+ scope TEXT PRIMARY KEY, window INTEGER NOT NULL, count INTEGER NOT NULL
 );
 """
 RESERVED = {"model", "role", "session", "session_id", "profile", "permissions",
@@ -85,12 +88,31 @@ def _policy(policy):
 
 
 def _config(config):
+    if isinstance(config, dict) and set(config) == {"action", "baseline", "profile"}:
+        if config["action"] not in ("owner", "handler") or not all(isinstance(config[k], dict) and config[k] for k in ("baseline", "profile")):
+            raise SubscriptionRefusal("invalid native installed configuration")
+        fields = config["profile"].get("fields")
+        if not isinstance(fields, list) or len(fields) > 32:
+            raise SubscriptionRefusal("invalid native data fields")
+        for field in fields:
+            _text(field)
+            if field.casefold() in RESERVED:
+                raise SubscriptionRefusal("authority fields cannot be event data fields")
+        if len(fields) != len(set(fields)):
+            raise SubscriptionRefusal("duplicate native data field")
+        # Native profile validator owns this versioned schema and rejects
+        # widening. Installation itself never authorizes its execution.
+        if len(_json(config).encode()) > 49152:
+            raise SubscriptionRefusal("native configuration too large")
+        return json.loads(_json(config))
     keys = {"profile_id", "profile_version", "baseline_version", "owner_generation",
             "target", "model", "role", "template", "fields", "required_tools",
             "baseline_policy", "subscription_policy", "profile_policy",
             "baseline_budget", "subscription_budget", "profile_budget"}
-    if not isinstance(config, dict) or set(config) != keys:
+    if not isinstance(config, dict) or set(config) - {"action"} != keys:
         raise SubscriptionRefusal("invalid installed configuration fields")
+    if config.get("action", "owner") not in ("owner", "handler"):
+        raise SubscriptionRefusal("invalid installed action")
     for key in ("profile_id", "profile_version", "baseline_version", "owner_generation", "model", "role"):
         _text(config[key])
     _text(config["template"], 4000)
@@ -118,7 +140,7 @@ def _config(config):
 
 
 class SubscriptionStore(Store):
-    """Explicit opt-in candidate. Trusted install/revoke calls have no HTTP route."""
+    """Explicit opt-in store. Trusted install/revoke calls have no HTTP route."""
 
     def __init__(self, path: Path):
         super().__init__(path)
@@ -174,7 +196,7 @@ class SubscriptionStore(Store):
         deliberately refused until an explicit audited upgrade contract exists.
         """
         if (not isinstance(manifest, dict) or set(manifest) != {"version", "publisher", "subscription"}
-                or type(manifest["version"]) is not int or manifest["version"] != 1):
+                or type(manifest["version"]) is not int or manifest["version"] not in (1, 2)):
             raise SubscriptionRefusal("unsupported installed manifest")
         publisher, sub = manifest["publisher"], manifest["subscription"]
         if not isinstance(publisher, dict) or set(publisher) != {"id", "token_sha256"}:
@@ -188,6 +210,8 @@ class SubscriptionStore(Store):
         _text(sub["id"])
         _text(sub["event_type"])
         profile = _config(sub["profile"])
+        if (manifest["version"] == 2) != (set(profile) == {"action", "baseline", "profile"}):
+            raise SubscriptionRefusal("manifest/profile schema version mismatch")
         encoded = _json(manifest)
         with self._transaction():
             old = self._db.execute("SELECT manifest_json FROM subscription_installation WHERE slot=1").fetchone()
@@ -217,6 +241,19 @@ class SubscriptionStore(Store):
             if not row:
                 raise SubscriptionRefusal("publisher authentication refused", code="unauthorized")
             return row["id"]
+
+    def rate_request(self, publisher_id, *, now=None):
+        """Bound authenticated requests (including invalid bodies and duplicates)."""
+        now = datetime.now(timezone.utc).timestamp() if now is None else now
+        with self._transaction():
+            self._rate("publisher:" + publisher_id, int(now // 60), 120)
+
+    def _rate(self, scope, window, limit):
+        row = self._db.execute("SELECT * FROM subscription_rate_windows WHERE scope=?", (scope,)).fetchone()
+        count = row["count"] if row and row["window"] == window else 0
+        if count >= limit:
+            raise SubscriptionRefusal("event rate limit reached", code="capacity")
+        self._db.execute("INSERT OR REPLACE INTO subscription_rate_windows VALUES (?,?,?)", (scope, window, count + 1))
 
     def accept(self, token: str, event: dict) -> dict:
         """Authenticate, authorize and atomically persist event + one delivery.
@@ -249,7 +286,10 @@ class SubscriptionStore(Store):
             if not sub:
                 raise SubscriptionRefusal("subscription unavailable", code="forbidden")
             config = json.loads(sub["config_json"])
-            if set(event["payload"]) != set(config["fields"]):
+            fields = config.get("fields")
+            if fields is None:
+                fields = config["profile"].get("fields")
+            if not isinstance(fields, list) or set(event["payload"]) != set(fields):
                 raise SubscriptionRefusal("payload fields do not match installed profile")
             for value in event["payload"].values():
                 _text(value, 8000)  # No nested event-supplied configuration.
@@ -264,6 +304,10 @@ class SubscriptionStore(Store):
                                             (publisher["id"],)).fetchone()[0]
             if outstanding >= 100:
                 raise SubscriptionRefusal("candidate publisher intake capacity reached", code="capacity")
+            count = self._db.execute("SELECT COUNT(*) FROM subscription_deliveries WHERE subscription_id=?", (sub["id"],)).fetchone()[0]
+            if count >= 100:
+                raise SubscriptionRefusal("subscription capacity reached", code="capacity")
+            self._rate("subscription:" + sub["id"], int(datetime.now(timezone.utc).timestamp() // 60), 120)
             event_id, delivery_id = "evt_" + secrets.token_hex(16), "evd_" + secrets.token_hex(16)
             self._db.execute("INSERT INTO subscription_events VALUES (?,?,?,?,?,?)",
                              (event_id, publisher["id"], event["id"], _hash(encoded), encoded,
@@ -289,6 +333,8 @@ class SubscriptionStore(Store):
             if not row:
                 raise SubscriptionRefusal("delivery unavailable or revoked")
             config = json.loads(row["config_json"])
+            if "baseline" in config:
+                raise SubscriptionRefusal("native preparation requires the enforced profile host")
             policy = {}
             for tool in config["baseline_policy"]:
                 level = min(LEVELS[config[key].get(tool, "deny")] for key in
