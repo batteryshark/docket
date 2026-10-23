@@ -146,8 +146,11 @@ absolute `directory`). Pointer and destination must be owned, not symlinks, and
 not group/other writable; existing read/execute bits are allowed. Roster/ledger
 privacy rules remain unchanged. The destination is only that directory's `inbox`.
 New alert files are 0600, fsynced and atomically linked without overwrite to
-`delivery-stall-<deterministic-key>.md`. No wake, resume, principal card, bus,
-service or new scheduler is involved. Per-tick probes are bounded by the existing
+`delivery-stall-<deterministic-key>.md`. No wake, resume, principal card,
+service, or new scheduler is involved. The inbox write is not a bus publish.
+An opt-in Tower notice, off unless `DOCKET_TOWER_NATS_URL` is a numeric loopback
+URL, may enqueue `ev.lead.delivery.stalled` for a new episode only; already-alerted
+epochs are not backfilled. See [docs/TOWER.md](docs/TOWER.md). Per-tick probes are bounded by the existing
 20-row roster and the evidence reader's bounds; ordinary due work runs first.
 
 Fresh pointer/destination validation precedes reservation. Known pre-reservation

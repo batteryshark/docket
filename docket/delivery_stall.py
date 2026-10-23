@@ -5,6 +5,7 @@ import os
 import stat
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 
@@ -235,6 +236,7 @@ class DeliveryStall:
                 if state.get("publication"):
                     pending = state["publication"]
                     m.save()
+                    self._note_tower(pending.get("tower"))
                     self.writer(pending["key"], pending["text"], destination=pending["destination"])
                     state["alerted"] = True
                     m.save()
@@ -252,9 +254,26 @@ class DeliveryStall:
                         "Content-level project observations cannot attribute work to one writer or establish acceptance; "
                         "configured artifact content is not proof of installation success.\n")
                 # Resolve before reserving; retries use only this frozen inbox identity.
+                # Inbox text still uses the running interval above. Tower minutes do not.
                 destination = self.resolver()
                 state["publication"] = dict(key=key, text=text, destination=destination)
+                payload = None
+                try:
+                    from docket.tower_publish import enabled, stall_episode
+                    if enabled():
+                        # Persisted evidence time, not the running streak. Idle gaps
+                        # reset ``since`` and must not shrink this notice.
+                        observed = datetime.fromisoformat(state["observed"])
+                        payload = stall_episode(
+                            sid, row["directory"],
+                            (now - observed).total_seconds() / 60.0, now, key,
+                        )
+                except Exception:
+                    payload = None
+                if payload:
+                    state["publication"]["tower"] = payload
                 m.save()
+                self._note_tower(payload)
                 self.writer(key, text, destination=destination)
                 state["alerted"] = True
                 m.save()
@@ -262,3 +281,13 @@ class DeliveryStall:
                 self.invalidate(sid)
                 self.error = "delivery-stall observation/publication unavailable; reserved effects may be uncertain"
         m.save()
+
+    def _note_tower(self, payload):
+        # New episode only. Already-alerted epochs never reach here. Inbox write is separate.
+        try:
+            tower = getattr(self.manager.scheduler, "tower", None)
+            if tower is None or not payload:
+                return
+            tower.note_stall(payload)
+        except Exception:
+            return
