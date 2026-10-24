@@ -129,3 +129,30 @@ Parent coordinates ONE natural 15-minute snapshot proof after install approval:
 read lease/projection, wait for its already scheduled occurrence (no new replay
 timer), correlate occurrence ID/Nats-Msg-Id through handler and resulting page
 snapshot; distinguish queue receipt, broker acceptance and actual page proof.
+
+## Supplemental enrolled project index
+
+`docket project-index --json` uses normal Docket discovery and the existing admin
+bearer for `GET /api/v1/tower/project-index`. No selectors or alternate credentials
+are accepted. `docket project-index --help` describes the command.
+
+Success is one JSON object, exit 0: exactly `version: 1`,
+`source: "docket.project-index"`, `observed_at` (UTC six-fraction Z), `complete: true`,
+and `leads`. Each lead has only `session`, absolute `directory`, `roster_state`
+(`active|hold|done`), and `activity`. Markerless enrolled rows are included. This is
+the complete enrolled roster, NOT a whole-project catalog; do not enroll Nod for it.
+Limits are 20 rows and 65536 UTF-8 bytes including HTTP JSON escaping; the existing
+private roster reader also rejects source files larger than 256000 bytes.
+Invalid, missing, unreadable, nonprivate or oversized sources return HTTP 503;
+there is no truncation or false-empty fallback. JSON CLI failures exit 1 with
+`{"version":1,"error":{"code":"unavailable","detail":"..."}}` (safe detail).
+
+Activity is exactly `{"state":"unknown"}` or, for example,
+`{"state":"busy","sample_at":"2026-10-24T00:00:00.000000Z","age_seconds":42,"basis":"docket.running_sample"}`.
+Busy uses only the existing volatile completed-evidence sample with matching
+session/directory/native-goal identity and healthy manager. Original sample age
+must be 0 through 120 seconds before truncation to an integer. Reads never renew
+sample time or query native status; restart, stale, failure, changed binding,
+hold/done or missing evidence means unknown, not idle. `observed_at` is response
+time, not sample time. No busy-start, last-work or acceptance inference is made.
+This read-only addition changes no clock, lease, holds, history or sampling policy.

@@ -131,6 +131,17 @@ class Handler(BaseHTTPRequestHandler):
         path, query = self._split()
         if raw is None and _retired_event_path(path):
             return self._error(404, "not_found", "no such path")
+        if path == "/api/v1/tower/project-index":
+            if not self._authed():
+                return self._error(401, "unauthorized", "admin bearer required; use the normal Docket token")
+            if urllib.parse.urlsplit(self.path).query:
+                return self._error(400, "invalid", "no query selectors allowed; use the fixed endpoint")
+            from docket.project_index import projection
+            try:
+                payload = projection(self.server.scheduler.checkins, self.server.scheduler.clock.now())
+            except Exception:
+                return self._error(503, "unavailable", "index source unavailable; restore the valid private source before retrying")
+            return self._send(200, payload)
         if path in ("/api/v1/tower/project-markers", "/api/v1/tower/snapshot-refresh-schedule"):
             if not self._authed():
                 return self._error(401, "unauthorized", "admin bearer required; use the normal Docket token")
