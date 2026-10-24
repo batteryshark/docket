@@ -180,6 +180,49 @@ Isolated policy tests inject the reader and writer. Operational installation and
 actual-use readback are recorded separately by the runtime owner. This lane never
 changes native lead models, goals or accepted markers, and never notifies the principal.
 
+## Idle behind one recorded question (optional)
+
+`DOCKET_QUESTION_STATUS_ARGV` is operator-owned JSON argv, for example
+`["/absolute/operator-installed/chief-question-status"]`. The executable must
+be absolute; at most 32 nonempty arguments and 4 KiB of configuration. No shell
+is used. Never put credentials, state paths, or question-controlled arguments
+here. Docket supplies only JSON stdin: `version:1`, native `session`, exact
+`directory`, and `goal:{id,created_at}` (native creation milliseconds).
+Configuration is captured at process startup; setting it is a separate reviewed
+operator action, not performed by this source change.
+
+The read-only helper is bounded to five seconds, 4 KiB input and 32 KiB stdout.
+Reads use the existing check executor, never wait in the minute/send path, and
+never answer, close, ACK or resume. Its v1 output must identify
+`source:"chief-question-status"`, `complete:true`, fresh timezone-aware
+`observed_at` (age 0–120 seconds), exact echoed bindings, and the complete
+`questions` list (at most 128). Every question must have a unique namespaced
+stable `id`, `status:"unresolved"`, exact bindings and `asked_at` between goal
+creation and observation. Missing, malformed, incomplete, legacy/unbound,
+future, regressing or stale observations are unknown, not zero questions.
+No journal, transcript, native private DB or guessed endpoint is read.
+
+Unset configuration disables this addition and preserves ordinary check-ins.
+Configured but missing/broken helper, first pending sample, or any unknown
+observation suppresses **both owned idle and milestone admissions**, including
+latched retries. Any known outstanding question (even multiple) also suppresses
+those nudges. Existing owned-only cancellation/retraction and uncertainty blocks
+apply; already consumed prompts cannot be recalled. Ordinary timers and watches
+are unchanged. A completed fresh zero-question snapshot permits ordinary nudges.
+
+Only roster-active, validated/unarchived native-idle leads with an unfinished
+active/blocked goal and exactly one bound unresolved question can alert. The same
+question/goal/directory must remain continuously observed for 30 minutes at the
+existing cadence. Activity, zero/multiple/unknown questions, identity changes,
+restart, backward clock or gap over 120 seconds resets continuity. A deterministic
+session/directory/goal/mode/question key in additive `question_stalls` dedupes
+across restart and activity; returning to the same question does not rearm it.
+Separate fresh native checks precede effects, but are not an atomic snapshot.
+Frozen inbox destination/text/key and optional Tower payload follow the existing
+reservation/retry rules; pending running publications are never overwritten.
+This says observed idle behind one recorded question, **not certified inactivity
+or fault**, and claims no coverage for unstructured or legacy questions.
+
 ## Source installation (not performed by this change)
 
 This source integrates the small check-in hooks into the public frozen-envelope

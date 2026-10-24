@@ -114,6 +114,7 @@ class DeliveryStall:
         self.resolver = resolver
         self.error = None
         self.samples = {}  # continuity deliberately lost on restart
+        self.question_samples = {}
         self.pending = {}
         self.retired = set()
         self.generations = {}
@@ -176,12 +177,14 @@ class DeliveryStall:
         try:
             rows = roster(m.roster_path)
         except Exception:
+            self.question_samples.clear()
             for sid in set(self.samples) | set(self.pending):
                 self.invalidate(sid)
             if m.roster_path.exists():
                 self.error = "delivery-stall roster unavailable"
             return
         states = m.state.setdefault("delivery_stalls", {})
+        self.question_tick(rows, now)
         if any(s.get("publication") and not s.get("alerted") for s in states.values()):
             self.error = "delivery-stall publication unresolved; frozen inbox reconciliation pending"
         for sid in (set(self.samples) | set(self.pending)) - set(rows):
@@ -281,6 +284,77 @@ class DeliveryStall:
                 self.invalidate(sid)
                 self.error = "delivery-stall observation/publication unavailable; reserved effects may be uncertain"
         m.save()
+
+    def question_tick(self, rows, now):
+        m = self.manager
+        source = getattr(m, "questions", None)
+        if source is None or not source.enabled:
+            self.question_samples.clear()
+            return
+        states = m.state.setdefault("question_stalls", {})
+        if any(s.get("publication") and not s.get("alerted") for s in states.values()):
+            self.error = "delivery-stall question publication unresolved; frozen inbox reconciliation pending"
+        for sid in set(self.question_samples) - set(rows):
+            self.question_samples.pop(sid, None)
+            source.forget(sid)
+        for sid, row in rows.items():
+            try:
+                snap = m.snapshot(sid)
+                if not snap or snap[2] != "idle":
+                    self.question_samples.pop(sid, None)
+                    if not snap:
+                        source.forget(sid)
+                    continue
+                row, goal, _ = snap
+                questions = source.get(sid, row["directory"], goal, now)
+                if questions is None or len(questions) != 1:
+                    self.question_samples.pop(sid, None)
+                    continue
+                scope = json.dumps([sid, row["directory"], goal, "idle_question", questions[0]], sort_keys=True)
+                key = hashlib.sha256(scope.encode()).hexdigest()
+                prior = self.question_samples.get(sid)
+                since = prior[2] if prior and prior[0] == key and 0 <= (now-prior[1]).total_seconds() <= 120 else now
+                self.question_samples[sid] = (key, now, since)
+                state = states.get(key, {})
+                if state.get("alerted"):
+                    continue
+                if not state.get("publication") and (now-since).total_seconds() < 1800:
+                    continue
+                # Separate reads, not an atomic snapshot. Recheck eligibility just
+                # before reserving/retrying any effect; unknown always suppresses.
+                fresh = m.snapshot(sid)
+                if (not fresh or fresh[2] != "idle" or fresh[1] != goal
+                        or fresh[0]["directory"] != row["directory"]
+                        or source.get(sid, row["directory"], goal, now) != questions):
+                    self.question_samples.pop(sid, None)
+                    continue
+                if not state.get("publication"):
+                    text = ("# Observed idle behind one recorded unresolved question\n\n"
+                            f"Detected: {now.isoformat()}\nIdle interval: {since.isoformat()} to {now.isoformat()}\n"
+                            f"Original session: {sid}\nAbsolute directory: {row['directory']}\nGoal: {goal!r}\n"
+                            "Usable: complete fresh bound question-status observations; one unchanged recorded unresolved question.\n"
+                            "Remaining: Chief review; no automatic resume.\n"
+                            "Limits: minute samples; recorded questions only; not certified inactivity or fault; "
+                            "separate native/source reads are not atomic.\n")
+                    destination = self.resolver()
+                    publication = dict(key=key, text=text, destination=destination)
+                    from docket.tower_publish import enabled, stall_episode
+                    if enabled():
+                        payload = stall_episode(sid, row["directory"], (now-since).total_seconds()/60,
+                                                now, key, reason="idle_question")
+                        if payload:
+                            publication["tower"] = payload
+                    state = states.setdefault(key, {})
+                    state["publication"] = publication
+                pending = state["publication"]
+                m.save()
+                self._note_tower(pending.get("tower"))
+                self.writer(pending["key"], pending["text"], destination=pending["destination"])
+                state["alerted"] = True
+                m.save()
+            except Exception:
+                self.question_samples.pop(sid, None)
+                self.error = "delivery-stall question observation/publication unavailable; reserved effects may be uncertain"
 
     def _note_tower(self, payload):
         # New episode only. Already-alerted epochs never reach here. Inbox write is separate.

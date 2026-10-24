@@ -296,7 +296,11 @@ class OpenCodeAdapter(DeliveryAdapter):
         status, active = self._request("GET", "/api/session/active")
         if status != 200:
             raise DeliveryError("unavailable", f"active lookup failed ({status})", retryable=True)
-        listed = (active or {}).get("data") or {}
+        listed = active.get("data") if isinstance(active, dict) else None
+        from docket.parse import validate_session_id
+        if (not isinstance(listed, (dict, list))
+                or any(validate_session_id(s) for s in listed)):
+            raise DeliveryError("unavailable", "invalid active lookup", retryable=True)
         if isinstance(listed, dict) and session_id in listed:
             return "active"
         if isinstance(listed, list) and session_id in listed:
