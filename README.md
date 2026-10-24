@@ -1,5 +1,8 @@
 # Docket
 
+Source contract: [fixed Tower project-pages lease and authenticated recorded-marker projection](docs/tower-refresh.md)
+(`docket tower-refresh --help`, `docket project-markers --help`). Queue acceptance is not page-refresh proof.
+
 <p><a href="assets/workstack-mark-full.png"><img src="assets/workstack-mark.png" alt="Docket: a comic alarm-clock mascot holding a reminder card" width="180"></a></p>
 
 **Wake an agent session later, without leaving a polling agent running.**

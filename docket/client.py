@@ -53,11 +53,11 @@ def resolve_token() -> str:
         raise ClientError("docket token is not available") from exc
 
 
-def request(method: str, path: str, body: dict | None = None, *, timeout: float = 15):
+def request(method: str, path: str, body: dict | None = None, *, timeout: float = 15, authenticated: bool = False):
     url = resolve_url() + path
     data = None if body is None else json.dumps(body).encode()
     headers = {"Accept": "application/json"}
-    if method != "GET":
+    if method != "GET" or authenticated:
         headers["Authorization"] = "Bearer " + resolve_token()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
