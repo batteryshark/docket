@@ -131,6 +131,19 @@ class Handler(BaseHTTPRequestHandler):
         path, query = self._split()
         if raw is None and _retired_event_path(path):
             return self._error(404, "not_found", "no such path")
+        if path in ("/api/v1/tower/project-markers", "/api/v1/tower/snapshot-refresh-schedule"):
+            if not self._authed():
+                return self._error(401, "unauthorized", "admin bearer required; use the normal Docket token")
+            from docket.tower_clock import projection, view
+            if query:
+                return self._error(400, "invalid", "no query selectors allowed; use the fixed endpoint")
+            if path.endswith("project-markers"):
+                try:
+                    payload = projection(self.server.scheduler.checkins.roster_path, self.server.scheduler.clock.now())
+                except Exception:
+                    return self._error(503, "unavailable", "marker source unavailable; restore the valid private source before retrying")
+                return self._send(200, payload)
+            return self._send(200, view(self.server.store, self.server.scheduler.clock.now()))
         if "view" in query:
             return self._panel_read(path, query)
         if path == "/health":
@@ -222,6 +235,16 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if body is None:
             return
+        if path in ("/api/v1/tower/snapshot-refresh-schedule", "/api/v1/tower/snapshot-refresh-schedule/cancel"):
+            from docket.tower_clock import mutate, ClockError
+            try:
+                with self.server._mutate, self.server.store._lock:
+                    payload = mutate(self.server.scheduler, body, cancel=path.endswith("/cancel"))
+            except ClockError as exc:
+                return self._error(exc.status, exc.code, exc.detail)
+            except LimitError:
+                return self._error(409, "limit", "schedule capacity exhausted; release capacity before ensure")
+            return self._send(200, payload)
         for prefix, is_occurrence in (("/api/v1/items/", False), ("/api/v1/occurrences/", True)):
             if path.startswith(prefix):
                 rest = path[len(prefix):].split("/")

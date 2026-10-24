@@ -183,6 +183,11 @@ class DeliveryStall:
             if m.roster_path.exists():
                 self.error = "delivery-stall roster unavailable"
             return
+        try:
+            from docket.tower_clock import observe
+            observe(m, rows, now)
+        except Exception:
+            self.error = "recorded-marker observation unavailable; reserved notices may be uncertain"
         states = m.state.setdefault("delivery_stalls", {})
         self.question_tick(rows, now)
         if any(s.get("publication") and not s.get("alerted") for s in states.values()):

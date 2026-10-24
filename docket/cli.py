@@ -29,6 +29,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = SafeArgumentParser(prog="docket", description="Local schedule service that wakes an agent session")
     parser.add_argument("--version", action="version", version=f"docket {__version__}")
     sub = parser.add_subparsers(dest="command")
+    markers = sub.add_parser("project-markers", allow_abbrev=False, help="read authoritative recorded markers (admin token; not acceptance-now)", epilog="Example: docket project-markers --json")
+    markers.add_argument("--json", action="store_true")
+    refresh = sub.add_parser("tower-refresh", allow_abbrev=False, help="manage the fixed 15-minute Tower project-pages lease (no agent wake)", epilog="Example: docket tower-refresh show --json")
+    actions = refresh.add_subparsers(dest="action", required=True)
+    for action in ("ensure", "show", "cancel"):
+        command = actions.add_parser(action, help={"ensure": "create or extend until; cancellation is permanent", "show": "read lease and queue receipt, not published-page proof", "cancel": "stop future notices; cannot retract queued notices"}[action])
+        command.epilog = "Example: docket tower-refresh " + action + (" --until 2026-11-01T00:00:00Z" if action == "ensure" else "") + " --json"
+        command.allow_abbrev = False
+        command.add_argument("--json", action="store_true")
+        if action == "ensure":
+            command.add_argument("--until", required=True, help="timezone-aware ISO deadline, future and within 90 days")
 
     serve = sub.add_parser("serve", help="run the HTTP service in the foreground")
     serve.add_argument("--host", default="127.0.0.1")
@@ -98,11 +109,19 @@ def main(argv: list[str] | None = None) -> int:
     pairing.add_argument("--stdin", action="store_true", required=True,
                          help="read link from stdin; hidden prompt on a terminal; never pass the link as an argument")
 
-    args = parser.parse_args(supplied)
+    try:
+        args = parser.parse_args(supplied)
+    except SystemExit as exc:
+        if exc.code and supplied and supplied[0] in ("tower-refresh", "project-markers") and "--json" in supplied:
+            print(json.dumps(dict(version=1, error=dict(code="invalid", detail="invalid arguments; use docket " + supplied[0] + " --help"))))
+            return 1
+        raise
     if not args.command:
         parser.print_help()
         return 2
     try:
+        if args.command in ("project-markers", "tower-refresh"):
+            return _tower(args)
         if args.command == "pair":
             from docket.pairing import PairingError, intake, redeem
             try:
@@ -162,6 +181,35 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--by", dest="created_by", default=None)
     parser.add_argument("--directory", default=None, help="pin the session directory")
     parser.add_argument("--json", action="store_true")
+
+
+def _tower(args):
+    path = "/api/v1/tower/" + ("project-markers" if args.command == "project-markers" else "snapshot-refresh-schedule")
+    method, body = "GET", None
+    if args.command == "tower-refresh" and args.action != "show":
+        method = "POST"
+        body = {"until": args.until} if args.action == "ensure" else {}
+        if args.action == "cancel":
+            path += "/cancel"
+    try:
+        _, payload = request(method, path, body, authenticated=True)
+        from docket.tower_clock import validate_response
+        validate_response(payload, args.command == "project-markers")
+    except (ClientError, ValueError) as exc:
+        error = dict(version=1, error=dict(code=getattr(exc, "code", None) or "unavailable",
+                                         detail=getattr(exc, "detail", "invalid service response; inspect service before retrying")))
+        print(json.dumps(error) if args.json else "docket: " + error["error"]["detail"], file=sys.stdout if args.json else sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(payload))
+    elif args.command == "project-markers":
+        print(f"complete recorded-marker snapshot: {len(payload['markers'])} markers (observations only)")
+    elif payload["schedule"] is None:
+        print("No Tower refresh lease; create with tower-refresh ensure --until <ISO deadline>")
+    else:
+        s = payload["schedule"]
+        print(f"{s['item_id']}  {s['status']}  every {s['every_seconds']}s  next={s['next_fire_at']}  until={s['until']}  expired={s['lease_expired']}  last={s['last_occurrence']}\nQueue acceptance is enqueued, NOT published or pages updated; cancel cannot retract queued notices.")
+    return 0
 
 
 def _serve(host: str, port: int) -> int:

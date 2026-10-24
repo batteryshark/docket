@@ -43,6 +43,7 @@ from docket.store import Occurrence
 from docket.delivery_state import issue, project, retry_refusal
 from docket.checkins import Checkins
 from docket.tower_publish import TowerPublisher
+from docket.tower_clock import event_only, utc, REFRESH_TYPE
 
 LEASE_SECONDS = 60
 MAX_ATTEMPTS = 8
@@ -611,6 +612,12 @@ class Scheduler:
     def _reclaim_occurrence(self, occ_id: str, now) -> bool:
         occ = self.store.get_occurrence(occ_id)
         parent = self.store.get(occ.item_id) if occ else None
+        if parent is not None and event_only(parent):
+            with self.store._lock:
+                occ = self.store.get_occurrence(occ_id)
+                if occ is None or occ.status != "firing":
+                    return False
+                return self._finish_tower_occurrence(parent, occ, now, "uncertain")
         return self._reclaim_unit(parent, occ, now) if parent else False
 
 
@@ -620,6 +627,15 @@ class Scheduler:
 
 
     def _fire_recurring(self, item) -> bool:
+        if event_only(item):
+            with self.store._lock:
+                fresh = self.store.get(item.id)
+                if fresh is None or fresh.status != "pending":
+                    return False
+                return self._fire_recurring_locked(fresh)
+        return self._fire_recurring_locked(item)
+
+    def _fire_recurring_locked(self, item) -> bool:
         now = self.clock.now()
         spec = dict(item.spec or {})
         occ_id = spec.get("open_occurrence_id")
@@ -627,7 +643,7 @@ class Scheduler:
             occ = self.store.get_occurrence(occ_id)
             if occ is None:
                 return self._ambiguous(item, None, None, issue("legacy_identity_unknown")["detail"])
-            if occ.status in ("delivered", "undeliverable"):
+            if occ.status in ("delivered", "undeliverable", "enqueued"):
                 return self._advance_recurring(item, occ, now)
             if occ.status == "cancelled":
                 return False
@@ -768,7 +784,48 @@ class Scheduler:
         return self._deliver_occurrence(item, occ)
 
     def _deliver_occurrence(self, item, occ) -> bool:
+        if event_only(item):
+            now = self.clock.now()
+            if item.status == "cancelled" or occ.status == "cancelled":
+                return False
+            if occ.status == "pending":
+                if not self.store.claim_occurrence(occ.id, now):
+                    return False
+                occ = self.store.get_occurrence(occ.id)
+            elif occ.status == "firing" and self._lease_fresh(occ.firing_at, now):
+                return False
+            elif occ.status != "firing":
+                return self._after_occurrence(item, occ, now)
+            if occ is None:
+                return False
+            # A pre-existing dispatch reservation is unknown, never a retry.
+            if occ.receipt:
+                return self._finish_tower_occurrence(item, occ, now, "uncertain")
+            occ.receipt = {"state": "reserved", "queue_result": "uncertain"}
+            occ.updated_at = now
+            if not self.store.cas_occurrence(occ, ("firing",)):
+                return False
+            fresh = self.store.get(item.id)
+            if fresh is None or fresh.status == "cancelled":
+                return False
+            plan = self._plan(item, occ, now)
+            data = dict(version=1, purpose="project_pages", item_id=item.id, occurrence_id=occ.id,
+                        scheduled_at=utc(occ.scheduled_at), fired_at=utc(now), coalesced=plan["coalesced"],
+                        schedule_until=item.spec["until"], provenance="docket_recurring_clock")
+            result = self.tower.note_fixed(REFRESH_TYPE, occ.id, data, utc(now))
+            return self._finish_tower_occurrence(item, occ, now, result)
         return self._deliver_unit(item, occ)
+
+    def _finish_tower_occurrence(self, item, occ, now, result):
+        occ.status = "enqueued" if result == "accepted" else "undeliverable"
+        occ.receipt = {"state": occ.status, "queue_result": result}
+        occ.updated_at = now
+        occ.coalesced = self._plan(item, occ, now)["coalesced"]
+        occ.next_attempt_at = None
+        occ.error = None if result == "accepted" else "Tower queue " + result + "; inspect authoritative projection"
+        if not self.store.cas_occurrence(occ, ("firing",)):
+            return False
+        return self._advance_recurring(item, occ, now)
 
     def _lookup_quiet(self, target, aid: str) -> str:
         try:
@@ -1019,7 +1076,7 @@ class Scheduler:
         item = self.store.get(item.id) or item
         if item.status == "cancelled":
             return
-        delivered = self.store.count_occurrences(item.id, "delivered")
+        delivered = self.store.count_occurrences(item.id, "enqueued" if event_only(item) else "delivered")
         spec = dict(item.spec or {})
         spec["open_occurrence_id"] = None
         spec["finished"] = reason
@@ -1031,7 +1088,8 @@ class Scheduler:
             item.error = None
         else:
             item.status = "undeliverable"
-            item.error = item.error or f"schedule ended ({reason}) with no delivered occurrence"
+            terminal = "enqueued" if event_only(item) else "delivered"
+            item.error = item.error or f"schedule ended ({reason}) with no {terminal} occurrence"
         self.store.cas_item(item, ("pending", "firing", "admitted", "ambiguous"))
         _log(f"{item.status} {item.id} {reason}")
 

@@ -25,6 +25,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from docket.tower_clock import REFRESH_TYPE, MARKER_TYPE, canonical_time, validate_marker
+
+FIXED_SUBJECTS = ("ev." + REFRESH_TYPE, "ev." + MARKER_TYPE)
 
 ENV_URL = "DOCKET_TOWER_NATS_URL"
 ENV_TOKEN = "DOCKET_TOWER_TOKEN_FILE"
@@ -154,6 +157,15 @@ class TowerPublisher:
         except Exception:
             return
 
+    def note_fixed(self, event_type, event_id, data, when):
+        """Queue receipt only: never broker acknowledgement or downstream freshness."""
+        if event_type not in (REFRESH_TYPE, MARKER_TYPE) or not enabled():
+            return "disabled"
+        body = encode_event(event_id, event_type, data, when)
+        if body is None:
+            return "uncertain"
+        return "accepted" if self._enqueue("ev." + event_type, event_id, body) else "full"
+
     def close(self, timeout: float = 3.0) -> None:
         """Join the producer after queued notices. A stuck bus is abandoned.
 
@@ -171,14 +183,15 @@ class TowerPublisher:
             pass
         thread.join(timeout)
 
-    def _enqueue(self, subject: str, event_id, body: bytes) -> None:
-        if self._closed or subject not in (FIRE_SUBJECT, STALL_SUBJECT) or not _safe_id(event_id):
-            return
+    def _enqueue(self, subject: str, event_id, body: bytes) -> bool:
+        if self._closed or subject not in (FIRE_SUBJECT, STALL_SUBJECT, *FIXED_SUBJECTS) or not _safe_id(event_id):
+            return False
         self._ensure()
         try:
             self._queue.put_nowait((subject, event_id, body))
         except queue.Full:
-            return
+            return False
+        return True
 
     def _ensure(self) -> None:
         with self._lock:
@@ -209,7 +222,7 @@ class TowerPublisher:
     def _publish(self, item) -> None:
         subject, event_id, body = item
         url = os.environ.get(ENV_URL)
-        if subject not in (FIRE_SUBJECT, STALL_SUBJECT) or not _safe_id(event_id):
+        if subject not in (FIRE_SUBJECT, STALL_SUBJECT, *FIXED_SUBJECTS) or not _safe_id(event_id):
             return
         try:
             _parse_url(url)
@@ -280,8 +293,33 @@ def encode_stall(episode: dict) -> bytes | None:
 
 
 def encode_event(event_id: str, event_type: str, data: dict, when: str) -> bytes | None:
-    if event_type not in (FIRE_TYPE, STALL_TYPE) or not _safe_id(event_id):
+    if event_type not in (FIRE_TYPE, STALL_TYPE, REFRESH_TYPE, MARKER_TYPE) or not _safe_id(event_id):
         return None
+    if event_type in (REFRESH_TYPE, MARKER_TYPE):
+        common = {"version", "provenance"}
+        fields = ({"purpose", "item_id", "occurrence_id", "scheduled_at", "fired_at", "coalesced", "schedule_until"}
+                  if event_type == REFRESH_TYPE else
+                  {"lead_session", "directory", "milestone_at", "milestone_ref", "observed_at", "roster_state"})
+        try:
+            if not isinstance(data, dict) or set(data) != common | fields or type(data.get("version")) is not int or data["version"] != 1:
+                return None
+            canonical_time(when)
+            if event_type == REFRESH_TYPE:
+                canonical_time(data["scheduled_at"])
+                canonical_time(data["schedule_until"])
+                if (data["purpose"] != "project_pages" or data["provenance"] != "docket_recurring_clock"
+                        or data["item_id"] != "dkt_tower_refresh" or data["occurrence_id"] != event_id
+                        or not re.fullmatch(r"occ_[0-9a-f]{16}", event_id)
+                        or type(data["coalesced"]) is not int or data["coalesced"] < 0 or data["fired_at"] != when):
+                    return None
+            else:
+                validate_marker(dict(id=event_id, session=data["lead_session"], directory=data["directory"],
+                                     milestone_at=data["milestone_at"], milestone_ref=data["milestone_ref"],
+                                     roster_state=data["roster_state"]))
+                if data["provenance"] != "recorded_marker_observation" or data["observed_at"] != when:
+                    return None
+        except (ValueError, TypeError, KeyError, UnicodeError, OverflowError):
+            return None
     event = {
         "specversion": "1.0",
         "id": event_id,
@@ -340,7 +378,7 @@ def read_token(path: str | None = None) -> str | None:
 
 def publish_nats(url: str, token: str, subject: str, event_id: str, body: bytes) -> None:
     """One JetStream publish. Raises only ``_Drop`` or an OS error with no token."""
-    if subject not in (FIRE_SUBJECT, STALL_SUBJECT) or not _safe_id(event_id):
+    if subject not in (FIRE_SUBJECT, STALL_SUBJECT, *FIXED_SUBJECTS) or not _safe_id(event_id):
         raise _Drop()
     if not isinstance(body, bytes) or not body or len(body) > MAX_EVENT_BYTES:
         raise _Drop()
