@@ -43,6 +43,18 @@ idle gap and is still what the inbox text describes). Already alerted epochs
 are not backfilled. The chief-inbox file, its key, and frozen retry are
 unchanged. Docket does not wake the chief; Tower owns that DATA wake.
 
+The same stall route also carries optional idle-question episodes. These have
+`reason:"idle_question"`, numeric `idle_minutes`, and fixed detail
+`observed idle behind one recorded unresolved question; not certified inactivity or fault`.
+They omit `minutes_since_landed`: idle duration is not a delivery timestamp.
+Session/directory/project remain unchanged, with no question body, question ID
+or goal text in the event. The event ID is the deterministic
+session/directory/native-goal/mode/question scope key, also used by the frozen
+inbox publication. Repeated activity/restart does not rearm the same key.
+Existing running notices retain their original fields and encoding. Consumers
+must discriminate `reason` before interpreting minutes. Helper configuration
+and fail-closed owned-nudge gating are described in [LEAD_CHECKINS.md](../LEAD_CHECKINS.md).
+
 ## How it runs
 
 The scheduler hook only `put_nowait`s onto one in-process queue of 32. It does

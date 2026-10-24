@@ -98,6 +98,8 @@ class Checkins:
             self.state = {"leads": {}, "owned": {}}
         for lead in self.state["leads"].values():
             lead["idle_since"] = None  # never infer continuous idle across restart
+        from docket.question_status import QuestionStatus
+        self.questions = QuestionStatus(scheduler.check_executor)
         from docket.delivery_stall import DeliveryStall
         self.delivery_stall = DeliveryStall(self)
 
@@ -177,6 +179,8 @@ class Checkins:
             if snap is None:
                 return False
             row, identity, activity = snap
+            if self.questions.enabled and self.questions.get(sid, row["directory"], identity, now) != []:
+                return False
             marker = [row.get("milestone_at"), row.get("milestone_ref")]
             if (identity != intent["goal"] or row["directory"] != item.target["directory"]
                     or marker != intent["marker"] or lead["goal"] != identity):
@@ -214,6 +218,7 @@ class Checkins:
                 self.delivery_stall.tick(now)
             except Exception:
                 self.delivery_stall.samples.clear()
+                self.delivery_stall.question_samples.clear()
                 self.delivery_stall.error = "delivery-stall ledger unavailable; publication suppressed"
             if self.delivery_stall.error:
                 self.error = "; ".join(filter(None, (self.error, self.delivery_stall.error)))
@@ -231,6 +236,10 @@ class Checkins:
             except Exception:
                 snap = None
             row, identity, activity = snap if snap else ({}, None, None)
+            question_blocked = bool(snap and self.questions.enabled
+                                    and self.questions.get(sid, row["directory"], identity, now) != [])
+            if not snap:
+                self.questions.forget(sid)
             marker = [row.get("milestone_at"), row.get("milestone_ref")]
             changed = (lead.get("goal") != identity or lead.get("marker") != marker
                        or lead.get("directory") != row.get("directory"))
@@ -242,7 +251,7 @@ class Checkins:
                     if req and not any(req["facts"].get(key) for key in ("cancelled", "consumed")):
                         slot["blocked"] = True
                 if item and item.status in ("pending", "firing", "admitted", "ambiguous"):
-                    if not snap or changed or kind == "idle" and activity != "idle":
+                    if not snap or changed or question_blocked or kind == "idle" and activity != "idle":
                         slot["blocked"] = not self.stop(item)
                 if item and item.status == "delivered" and not slot.get("consumed"):
                     slot["consumed"] = True
@@ -265,6 +274,8 @@ class Checkins:
                 lead["idle_since"] = now.isoformat()
             baseline = max(stamp(lead["baseline"]), stamp(row["milestone_at"])) if row.get("milestone_at") else stamp(lead["baseline"])
             for kind in PROMPTS:
+                if question_blocked:
+                    continue
                 slot = lead["slots"].get(kind)
                 if slot:
                     item = store.get(slot["id"])

@@ -360,3 +360,53 @@ class CheckinTests(unittest.TestCase):
         self.tick(35)
         self.assertEqual(self.item().id, old.id)
         self.assertEqual(len(self.host.sent), 1)
+
+    def test_configured_questions_gate_both_nudges_and_latched_send(self):
+        from docket.question_status import QuestionStatus
+        from tests.test_delivery_stall import question_snapshot
+        self.ids = ("heartbeat:a", "heartbeat:b")
+        self.manager.questions = QuestionStatus(self.scheduler.check_executor, raw='["/fixture/helper"]',
+            reader=lambda cmd, b: question_snapshot(b, self.clock.now(), self.ids))
+        self.tick()
+        self.tick(181)
+        self.assertEqual(self.host.sent, [])
+        self.ids = ()
+        self.tick(2)
+        item = self.item()
+        self.assertTrue(self.manager.allowed(item, self.clock.now()))
+        self.manager.questions.command = None  # configured broken is unknown, never disabled
+        from docket.checks import Outcome
+        self.scheduler._latch_watch(item, item.spec, Outcome("met"), self.clock.now())
+        self.assertEqual(self.host.sent, [])
+
+    def test_question_gate_retracts_only_owned_admission(self):
+        self.host.consume_immediately = False
+        self.tick()
+        self.tick(30)
+        aid = self.host.sent[0]["admission_id"]
+        self.host.inbox.add("msg_unrelated")
+        from docket.question_status import QuestionStatus
+        self.manager.questions = QuestionStatus(self.scheduler.check_executor, raw="malformed")
+        self.tick(1)
+        self.assertNotIn(aid, self.host.inbox)
+        self.assertIn("msg_unrelated", self.host.inbox)
+        self.tick(190)
+        self.assertEqual(len(self.host.sent), 1)
+
+    def test_malformed_native_activity_is_not_idle(self):
+        for data in (None, "idle", 1, [dict(id=SID)], {"garbage": "idle"}):
+            adapter = OpenCodeAdapter()
+            adapter._request = lambda method, path: (200, {"data": data} if path.endswith("/active") else {"data": {}})
+            with self.subTest(data=data), self.assertRaises(DeliveryError):
+                adapter.session_state(SID)
+
+    def test_configured_zero_questions_preserves_active_milestone(self):
+        from docket.question_status import QuestionStatus
+        from tests.test_delivery_stall import question_snapshot
+        self.manager.questions = QuestionStatus(self.scheduler.check_executor, raw='["/fixture/helper"]',
+            reader=lambda cmd, b: question_snapshot(b, self.clock.now(), ()))
+        self.host.active.add(SID)
+        self.tick()
+        self.tick(180)
+        self.assertEqual(len(self.host.sent), 1)
+        self.assertIn("no recorded visible milestone", self.host.sent[0]["message"])

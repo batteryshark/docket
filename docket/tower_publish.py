@@ -36,6 +36,7 @@ FIRE_SUBJECT = "ev.docket.timer.fired"
 STALL_TYPE = "lead.delivery.stalled"
 STALL_SUBJECT = "ev.lead.delivery.stalled"
 STALL_DETAIL = "observed content baseline unchanged; not certified acceptance"
+QUESTION_DETAIL = "observed idle behind one recorded unresolved question; not certified inactivity or fault"
 
 MAX_EVENT_BYTES = 64 * 1024
 IO_DEADLINE = 2.0
@@ -84,7 +85,7 @@ def enabled() -> bool:
     return True
 
 
-def stall_episode(lead_session, directory, minutes_since_landed, detected_at, episode_id):
+def stall_episode(lead_session, directory, minutes_since_landed, detected_at, episode_id, *, reason=None):
     """Frozen JSON-safe stall notice, or None if it must not be published.
 
     ``project`` is the directory's final component, not goal text or event prose.
@@ -99,7 +100,7 @@ def stall_episode(lead_session, directory, minutes_since_landed, detected_at, ep
         when = _time(detected_at)
         if directory is None or project is None or minutes is None or when is None:
             return None
-        return {
+        payload = {
             "id": episode_id,
             "time": when,
             "lead_session": lead_session,
@@ -108,6 +109,12 @@ def stall_episode(lead_session, directory, minutes_since_landed, detected_at, ep
             "minutes_since_landed": minutes,
             "detail": STALL_DETAIL,
         }
+        if reason == "idle_question":
+            payload.pop("minutes_since_landed")
+            payload.update(reason=reason, idle_minutes=minutes, detail=QUESTION_DETAIL)
+        elif reason is not None:
+            return None
+        return payload
     except Exception:
         return None
 
@@ -249,7 +256,10 @@ def encode_stall(episode: dict) -> bytes | None:
     lead = _session(episode.get("lead_session"))
     directory = _directory(episode.get("directory"))
     project = _project(directory)
-    minutes = _minutes(episode.get("minutes_since_landed"))
+    question = episode.get("reason") == "idle_question"
+    if episode.get("reason") not in (None, "idle_question"):
+        return None
+    minutes = _minutes(episode.get("idle_minutes" if question else "minutes_since_landed"))
     when = episode.get("time")
     if lead is None or directory is None or project is None or minutes is None:
         return None
@@ -263,6 +273,9 @@ def encode_stall(episode: dict) -> bytes | None:
         "minutes_since_landed": minutes,
         "detail": STALL_DETAIL,
     }
+    if question:
+        data.pop("minutes_since_landed")
+        data.update(reason="idle_question", idle_minutes=minutes, detail=QUESTION_DETAIL)
     return encode_event(episode_id, STALL_TYPE, data, when)
 
 

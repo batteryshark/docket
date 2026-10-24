@@ -647,6 +647,19 @@ class StallTests(TowerCase):
         self.assertIsNone(stall_episode("not a session", "/fixture", 30, now, "ab" * 32))
         self.assertIsNone(stall_episode(SID, "/fixture", True, now, "ab" * 32))
 
+    def test_idle_question_discriminator_and_honest_minutes(self):
+        from docket.tower_publish import QUESTION_DETAIL, encode_stall
+        episode = stall_episode(SID, "/fixture", 30, utc(2026, 10, 23), "ab"*32, reason="idle_question")
+        episode["question_text"] = "private never emitted"
+        episode["detail"] = "untrusted"
+        event = json.loads(encode_stall(episode))
+        self.assertEqual(event["type"], "lead.delivery.stalled")
+        self.assertEqual(event["data"]["reason"], "idle_question")
+        self.assertEqual(event["data"]["detail"], QUESTION_DETAIL)
+        self.assertEqual(event["data"]["idle_minutes"], 30.0)
+        self.assertNotIn("minutes_since_landed", event["data"])
+        self.assertNotIn("private", json.dumps(event))
+
 
 def _world(transport, token, url="nats://127.0.0.1:9", executor=None):
     os.environ[ENV_URL] = url
