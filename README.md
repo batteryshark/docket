@@ -1,8 +1,5 @@
 # Docket
 
-Source contract: [fixed Tower project-pages lease and authenticated recorded-marker projection](docs/tower-refresh.md)
-(`docket tower-refresh --help`, `docket project-markers --help`). Queue acceptance is not page-refresh proof.
-
 <p><a href="assets/workstack-mark-full.png"><img src="assets/workstack-mark.png" alt="Docket: a comic alarm-clock mascot holding a reminder card" width="180"></a></p>
 
 **Wake an agent session later, without leaving a polling agent running.**
@@ -14,11 +11,8 @@ Windows. The Unix core uses the standard library; Windows also requires
 `tzlocal>=5.0` and `tzdata`. An optional OpenChamber panel lists and removes
 items; it does not deliver wakes. An optional [Pi companion adapter](docs/pi.md)
 targets an existing persistent Pi recipient, with saved-intake-only evidence.
-Opt-in Tower notices for fires and new delivery-stall episodes stay off unless
-`$DOCKET_TOWER_NATS_URL` is a numeric loopback URL; see [Tower notices](docs/TOWER.md).
-That notice does not change delivery, Pi intake, or the limits below. Event
-intake belongs to [Tower](https://github.com/batteryshark/tower); see
-[clock-only split](docs/CLOCK_ONLY.md).
+Docket is clock-only; optional [Tower integration](#tower-integration-optional)
+is described below.
 
 ## Why use Docket?
 
@@ -175,9 +169,8 @@ exact frozen user-message consumption from an item still in the inbox.
 
 Check compatibility on the caller's host before real scheduling. Merely sharing
 a transcript database or delivering to an idle session does not prove ownership
-of a busy turn. Historical Mac 0.3.0 own-client pairing, delivery, retained items
-through Docket-service restart and installed panel relay/removal were accepted;
-this does not certify newer source/platform behavior or authorize app restart.
+of a busy turn. Docket does not restart the host application, and nothing here
+certifies behavior on a host or platform you have not checked.
 
 Optional OpenChamber own-client pairing requires explicit operator consent;
 follow [PAIRING.md](PAIRING.md). It grants **broad session API access**, not
@@ -221,43 +214,30 @@ uninstall retains the Windows manifest, including its reconfiguration restrictio
 Docket does not manage the agent host. The runbook includes separate, optional
 OpenCode startup recipes: Linux boot availability depends on existing user-manager/
 linger policy; Windows requires interactive logon, not a logged-out boot service.
-Native Linux reboot with automatic services and a retained timer wake/ACK was
-accepted. Actual Windows logon automatically started both services and the
-original retained watch produced exact saved intake and a completed tool-free ACK.
-Windows OS reboot was **not separately tested**. These are bounded demonstrations,
-not universal availability or task-execution guarantees. Pi saved intake does not
-prove Pi startup, unattended availability, authentication or model readiness.
+Reboot and logon behavior has been demonstrated only in bounded cases, and
+Windows OS reboot has not been separately tested. None of it is a universal
+availability or task-execution guarantee. Pi saved intake does not prove Pi startup, unattended availability,
+authentication or model readiness.
 
-## Clock-only architecture and split
+## Tower integration (optional)
 
-Docket schedules timers, alarms, recurring schedules, watches, and check-ins/stall
-attention, and publishes best-effort notices. Event intake, routing, and handling
-belong to [Tower](https://github.com/batteryshark/tower). Event intake, subscription
-queues, wake profiles, sandbox runners, and event outcome journaling are not Docket
-capabilities.
-
-Clock-only startup leaves legacy event tables/data and private configuration
-untouched; it does not drop, drain or replay them. A consistent pre-cut backup is
-retained by the operator. Prior event-intake and sandbox-runtime code is preserved
-at the public retention reference
-[event-runtime-before-clock-cut-20261023](https://github.com/batteryshark/docket/tree/event-runtime-before-clock-cut-20261023)
-for later agent launch profiles. See [docs/CLOCK_ONLY.md](docs/CLOCK_ONLY.md).
+Docket can publish best-effort notices for fires and new delivery-stall episodes
+to a [Tower](https://github.com/batteryshark/tower) event bus. This is off unless
+`$DOCKET_TOWER_NATS_URL` is a numeric loopback URL, and ordinary wakes do not
+depend on it. It does not change delivery, Pi intake or the limits above. See
+[Tower notices](docs/TOWER.md); the clock-only scope is in
+[docs/CLOCK_ONLY.md](docs/CLOCK_ONLY.md).
 
 ## API, MCP and private state
 
-### Current work — 22 October 2026
+### Lead check-ins
 
 Opt-in [lead check-ins](LEAD_CHECKINS.md) add observed-idle and explicit-milestone
-nudges through bounded owned watches. Missing private roster means off; one-line
-hold/done controls and the existing four-eligible-pair capacity apply. Check-ins
-have source tests and a recorded macOS activation, but automatic consumed-wake
-proof remains pending; Windows/Linux check-in compatibility is not established.
-The accepted cross-platform core and Pi restrictions above are unchanged.
+nudges through bounded owned watches. A missing private roster means off; one-line
+hold/done controls and a four-eligible-pair capacity apply. Check-ins are not
+established on Windows or Linux.
 
-The [clock-only split](docs/current-work.md) removes event intake from Docket and
-points event-driven work at Tower. The public retention tag keeps the prior
-runtime for later launch profiles. Publishing source does not install
-configuration, enroll owners, drop legacy event tables, or enable delivery.
+### API and MCP
 
 API reads are local; mutations require the Docket bearer token. Metadata is at
 `GET /api/v1/meta`, with listings at `/api/v1/items` and `/api/v1/occurrences`.
@@ -286,31 +266,41 @@ is read, never modified; an unreadable overlay is not treated as no archived ses
 
 ## Optional OpenChamber panel
 
-![Docket panel showing zero outstanding items, one undeliverable item and a service 0.3.0 notice](assets/screenshots/q88-manual-srgb-docket.png)
+![Docket panel showing zero outstanding items, one undeliverable item and a service notice](assets/screenshots/q88-manual-srgb-docket.png)
 
-Genuine panel screenshot: **0 outstanding, 1 undeliverable**, not an
-empty healthy scheduler. The service upgrades separately; the panel does not
-restart it. This is not proof of delivery, pairing, restart or packaged-extension
-acceptance.
+Illustrative screenshot only, not live health: it shows 0 outstanding and
+1 undeliverable item, which is not an empty healthy scheduler. It is not
+evidence of delivery, pairing or restart behavior.
 
-The [panel source and built JavaScript](openchamber/README.md) are included.
-Historical Mac acceptance included visual approval and installed host-route
-relay/removal, not UI-click automation or current platform certification. The
-relay keeps the Docket API token server-side, never in the iframe; the panel does
-not deliver wakes. Any installation is a separate principal-managed action.
+The panel lists outstanding items and undeliverable history, and can remove an
+item; it does not deliver wakes. Its relay keeps the Docket API token
+server-side, never in the iframe. The [panel source and built JavaScript](openchamber/README.md)
+are included. Installing the panel is a separate operator action and does not
+restart the service.
 
 ## Known limitations
 
-Do not run full test discovery, browser/CDP, e2e or evidence scripts: a browser
-updater escaped an earlier isolation attempt. Browser test sources remain for
-containment review. The historical browser-era suite was not green; no full-suite
-acceptance is claimed. This documentation authorizes no new live validation.
+Platform lifecycle behavior was demonstrated in bounded cases and is not a
+universal delivery or availability guarantee. Real revocation remains unproven.
+The optional Pi route proves saved intake only, not execution, authentication,
+busy-steer integration or unattended availability; see its
+[specific limits](docs/pi.md). Codex and Claude Code existing-session wake parity
+is not established.
 
-Historical Mac acceptance and bounded Linux/Windows lifecycle evidence are not
-universal delivery guarantees. Real revocation remains unproven. The optional
-Pi route proves saved intake only, not execution, authentication, busy-steer
-integration or unattended availability; see its [specific limits](docs/pi.md).
-Codex and Claude Code existing-session wake parity is not established.
+Lead check-ins have not been established on Windows or Linux. No full-suite
+acceptance is claimed, and browser, end-to-end and evidence scripts are not part
+of the documented checks.
+
+## Testing
+
+A focused, non-browser check:
+
+```sh
+python3 -B -m unittest tests.test_schedule tests.test_checks -v
+```
+
+Use an isolated `DOCKET_HOME` for integration tests. Browser integration tests
+require separate setup and are not part of the quick check above.
 
 ## License and artwork
 
