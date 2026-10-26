@@ -4,13 +4,8 @@
 The existing scheduler reconciles at most once a minute; existing watch polling,
 queue admission, stable message IDs, receipts and retries do the delivery.
 
-Check-ins are opt-in and verified in isolated macOS source tests. An existing
-macOS installation was enabled; an automatic consumed check-in wake is still
-unproved in the recorded activation report. This public source port is not a
-deployment. The POSIX private-path checks and absolute POSIX roster directories
-are not Windows/Linux check-in compatibility proof. Ordinary cross-platform
-scheduling and the optional Pi adapter retain their existing contracts; check-ins
-target OpenCode only, not Pi.
+Check-ins target OpenCode, not Pi. Their POSIX private-path checks and roster
+directories are intended for macOS; Windows and Linux compatibility is not established.
 
 ## One line per lead
 
@@ -223,18 +218,11 @@ reservation/retry rules; pending running publications are never overwritten.
 This says observed idle behind one recorded question, **not certified inactivity
 or fault**, and claims no coverage for unstructured or legacy questions.
 
-## Source installation (not performed by this change)
+## Installation
 
-This source integrates the small check-in hooks into the public frozen-envelope
-core. Eligibility stops use that core's durable cancellation and exact frozen
-status evidence, not an ID-only consumption lookup. No schema migration,
-CLI delivery format change, new dependency, service or scheduler registration.
-Do not copy the entire public core over an older live installation without a
-separate deployment review, or overwrite its private state.
-The existing Docket process needs **one ordinary restart** to load changed Python
-source. Installing the private roster then enables check-ins automatically.
-Review diff and author tests before any live install/restart/roster creation.
-No restart, roster installation or live wake is performed by publishing source.
+Restart Docket after updating its Python source. Installing the private roster
+enables check-ins automatically. Preserve the existing private state and review
+pending admissions before changing eligibility.
 
 ## Experimental own-row milestone helper (not wired)
 
@@ -249,4 +237,4 @@ Private modes, symlinks, duplicate keys, conflicts and future/backward timestamp
 are refused. Cooperating writers use a nonblocking lock plus an expected-bytes
 check; a noncooperating final read/rename race remains, not a general CAS promise.
 Its `fcntl`/fixed macOS copy command implementation is source-tested on macOS,
-not Windows/Linux certified. See [current-work limits](docs/current-work.md).
+not Windows/Linux certified.
