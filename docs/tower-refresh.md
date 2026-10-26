@@ -1,7 +1,7 @@
 # Fixed Tower refresh and recorded-marker source contract v1
 
-Source/tests only. Installation, service changes and the first natural snapshot proof
-require parent review. This is not an installation or downstream freshness claim.
+This optional integration schedules bounded refresh notices. It does not establish
+that a downstream consumer has refreshed its content.
 
 ## Normal caller boundary
 
