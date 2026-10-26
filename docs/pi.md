@@ -1,14 +1,10 @@
 # Optional Pi companion adapter
 
-The companion contract is published in [pi-a2a 0.2.0's README](https://github.com/batteryshark/pi-a2a/blob/ceafe6f8f2c3e1d9d2e85845feac96f13dc30853/README.md),
-commit `ceafe6f8f2c3e1d9d2e85845feac96f13dc30853`. Bounded actual use of the normal
-installed Docket CLI and daemon on native Windows has verified queue/no-reply
-saved intake in an existing persistent Pi 1.0.4 RPC recipient, with trusted
-Node 22.23.3 and the unmodified published companion. A transient `A2A_BUSY`
-status was resolved by one authorized later status for the original caller/key,
-without another send. This is not first-try or unattended availability, latency,
-throughput, OS-restart or universal Windows assurance. Existing Mac/Linux
-acceptance is unchanged; this does not extend it to Pi on those platforms.
+The adapter uses the [pi-a2a 0.2.0 companion contract](https://github.com/batteryshark/pi-a2a/blob/ceafe6f8f2c3e1d9d2e85845feac96f13dc30853/README.md).
+It requires an existing persistent Pi RPC recipient and a compatible Node runtime.
+Queue/no-reply saved intake is supported; unattended availability, task execution
+and Docket busy-steer integration are not established. For `A2A_BUSY` after a
+possible send, inspect status using the original caller/key rather than resending.
 
 For Pi, `delivered` means only consumed / `saved_exact` intake; execution and
 provider readiness remain unknown. It does not prove model understanding,
