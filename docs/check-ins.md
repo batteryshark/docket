@@ -146,7 +146,7 @@ New alert files are 0600, fsynced and atomically linked without overwrite to
 service, or new scheduler is involved. The inbox write is not a bus publish.
 An opt-in Tower notice, off unless `DOCKET_TOWER_NATS_URL` is a numeric loopback
 URL, may enqueue `ev.lead.delivery.stalled` for a new episode only; already-alerted
-epochs are not backfilled. See [docs/TOWER.md](docs/TOWER.md). Per-tick probes are bounded by the existing
+epochs are not backfilled. See [TOWER.md](TOWER.md). Per-tick probes are bounded by the existing
 20-row roster and the evidence reader's bounds; ordinary due work runs first.
 
 Fresh pointer/destination validation precedes reservation. Known pre-reservation
@@ -226,7 +226,7 @@ pending admissions before changing eligibility.
 
 ## Experimental own-row milestone helper (not wired)
 
-[`docket.milestone`](docket/milestone.py) accepts only `milestone_at` and
+[`docket.milestone`](../docket/milestone.py) accepts only `milestone_at` and
 `milestone_ref` on stdin. A trusted native wrapper must supply
 `DOCKET_CALLER_SESSION` and `DOCKET_CALLER_DIRECTORY`; environment identity is
 trusted-process input, **not authentication**. No native tool registration exists.

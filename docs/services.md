@@ -38,7 +38,7 @@ state when configured, and delivery history. POSIX state is owner-only (director
 0700, private files 0600). Windows checks owner/private ACLs, reparse points and
 file link counts; it does not silently repair broad existing permissions.
 Keep logs and service records private too. Do not print tokens or put credentials
-in arguments; existing [own-client pairing](../PAIRING.md) remains unchanged.
+in arguments; existing [own-client pairing](pairing.md) remains unchanged.
 
 Moving or updating a registered deployment requires deliberate operator-controlled
 reconfiguration preserving the service record and state. There is no upgrade

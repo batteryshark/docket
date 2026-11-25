@@ -17,7 +17,7 @@ credential and deployment records are not licensed distribution material.
 
 ## Redistributed artwork and capture
 
-The comic marks in `assets/workstack-mark*.png` are AI-generated artwork.
+The comic marks in `assets/docket-mark*.png` are AI-generated artwork.
 The principal chooses the MIT terms in LICENSE for these redistributed assets
 to the extent applicable, without claiming exclusive copyright in AI output.
 This grant does not cover private reference images, model weights or vendor tools.

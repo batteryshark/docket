@@ -1,6 +1,6 @@
 # Docket
 
-<img src="assets/workstack-mark.png" alt="Docket alarm-clock mascot" width="180">
+<img src="assets/docket-mark.png" alt="Docket alarm-clock mascot" width="180">
 
 Docket is a local scheduler that wakes an existing agent session later without keeping a model running to poll. It provides timers, alarms, bounded recurring schedules and watches through a CLI, loopback HTTP API and stdio MCP server. Schedules persist in SQLite independently of the agent host; Docket must be running and the target host available to deliver them.
 
@@ -69,12 +69,12 @@ Recurring schedules require a count or expiry; missed intervals coalesce. Watche
 
 ## Documentation
 
-- [CLI and MCP usage](AGENT_USAGE.md)
-- [Host setup](docs/host-setup.md) and [OpenChamber pairing](PAIRING.md)
+- [CLI and MCP usage](docs/usage.md)
+- [Host setup](docs/host-setup.md) and [OpenChamber pairing](docs/pairing.md)
 - [Service installation and maintenance](docs/services.md)
 - [Delivery status and recovery](docs/delivery-status.md)
 - [Optional Pi adapter](docs/pi.md)
-- [Optional check-ins](LEAD_CHECKINS.md), [event notices](docs/TOWER.md) and [refresh schedules](docs/tower-refresh.md)
+- [Optional check-ins](docs/check-ins.md), [event notices](docs/TOWER.md) and [refresh schedules](docs/tower-refresh.md)
 - [Optional OpenChamber panel](openchamber/README.md)
 
 ## License

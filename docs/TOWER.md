@@ -53,7 +53,7 @@ session/directory/native-goal/mode/question scope key, also used by the frozen
 inbox publication. Repeated activity/restart does not rearm the same key.
 Existing running notices retain their original fields and encoding. Consumers
 must discriminate `reason` before interpreting minutes. Helper configuration
-and fail-closed owned-nudge gating are described in [LEAD_CHECKINS.md](../LEAD_CHECKINS.md).
+and fail-closed owned-nudge gating are described in [check-ins.md](check-ins.md).
 
 ## How it runs
 

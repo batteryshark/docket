@@ -6,7 +6,7 @@ The host must support `POST /api/session/{session_id}/prompt` with a caller-supp
 
 Normal wakes queue for the end of the current turn. Urgent wakes use steer at a model-step boundary, not during token generation. The target host must own the session's active turn. A shared transcript database alone does not establish that compatibility.
 
-Optional [OpenChamber pairing](../PAIRING.md) gives Docket its own desktop-client identity and broad session API access. Pairing state locks host selection: a missing, expired, revoked or mismatched binding does not fall back to another credential or unauthenticated route. The own-record check is not a host-enforced wake-only capability, and a check/request race remains.
+Optional [OpenChamber pairing](pairing.md) gives Docket its own desktop-client identity and broad session API access. Pairing state locks host selection: a missing, expired, revoked or mismatched binding does not fall back to another credential or unauthenticated route. The own-record check is not a host-enforced wake-only capability, and a check/request race remains.
 
 Use `--directory` to pin an OpenCode target to its location. Missing, archived or wrong-location sessions are refused or become undeliverable. Pi targets use a separate explicit adapter; see [Pi setup](pi.md).
 

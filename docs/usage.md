@@ -1,6 +1,6 @@
 # CLI and MCP usage
 
-Start the Docket service and configure a compatible [delivery host](docs/host-setup.md) before scheduling. The [service guide](docs/services.md) covers installation and maintenance.
+Start the Docket service and configure a compatible [delivery host](host-setup.md) before scheduling. The [service guide](services.md) covers installation and maintenance.
 
 ## MCP
 
@@ -45,11 +45,11 @@ Capacity is 200 pending items globally, 20 per target, at most 5 recurring and 8
 
 `list` defaults to pending, including firing, admitted and ambiguous states. Inspect occurrences separately from schedule lifecycle. An admitted or uncertain occurrence holds the next recurrence until resolved. A fire more than five seconds late is marked late.
 
-Cancellation stops future scheduling and attempts to retract queued admissions. It preserves history and cannot undo consumed work. Inspect `schedule_stopped` separately from retraction (`not_sent`, `retracted`, `too_late`, `uncertain`). Missing receipts do not authorize a replacement wake or new request identity. See [delivery status and recovery](docs/delivery-status.md) for reconciliation and bounded pre-dispatch retry.
+Cancellation stops future scheduling and attempts to retract queued admissions. It preserves history and cannot undo consumed work. Inspect `schedule_stopped` separately from retraction (`not_sent`, `retracted`, `too_late`, `uncertain`). Missing receipts do not authorize a replacement wake or new request identity. See [delivery status and recovery](delivery-status.md) for reconciliation and bounded pre-dispatch retry.
 
 ## Optional adapters
 
-- [OpenChamber pairing](PAIRING.md) uses Docket's own private client binding.
-- [Pi](docs/pi.md) requires explicit `--adapter pi --session pi/ID` and an existing persistent recipient. Pi does not support directory pins or `session_idle`; Docket never launches Pi.
+- [OpenChamber pairing](pairing.md) uses Docket's own private client binding.
+- [Pi](pi.md) requires explicit `--adapter pi --session pi/ID` and an existing persistent recipient. Pi does not support directory pins or `session_idle`; Docket never launches Pi.
 
 Docket does not execute commands, scripts or shells. Delivery records saved message intake, not model readiness, understanding or completion of the requested task.

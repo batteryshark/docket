@@ -43,7 +43,7 @@ before optional metadata checks. Each paired session request requires the saved
 own-id active-record/revocation guard. Failure is visible, with no silent fallback
 or anonymous retry. This guard is not a host-enforced capability boundary:
 optional loopback auth can accept a missing/invalid bearer. Never borrow app or
-other-client credentials. See [PAIRING.md](../PAIRING.md).
+other-client credentials. See [docs/pairing.md](../docs/pairing.md).
 
 **Historical blocker only:** the earlier `desktopLocalClientToken` approach was
 stopped when that key was absent. Supported own-client pairing supersedes it;

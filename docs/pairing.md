@@ -1,6 +1,6 @@
 # OpenChamber client pairing
 
-Pairing makes Docket its own named desktop client with broad session API access, not a wake-only capability. It stores only its own returned token and binding. The token has no pairing-imposed expiry; manage the client through OpenChamber's device list. Generic OpenCode installations can operate without pairing; see [host setup](docs/host-setup.md).
+Pairing makes Docket its own named desktop client with broad session API access, not a wake-only capability. It stores only its own returned token and binding. The token has no pairing-imposed expiry; manage the client through OpenChamber's device list. Generic OpenCode installations can operate without pairing; see [host setup](host-setup.md).
 
 ## Pair
 
@@ -30,4 +30,4 @@ For desktop requests Docket reads the numeric `desktopLocalPort` from `~/.config
 
 Before each paired session request, `/api/client-auth/clients` must return exactly one matching own client record without expiry or revocation. This is a local own-record guard, not a host-enforced wake-only capability. Optional-auth hosts may accept missing or bogus bearers, and a guard/request race remains; live revocation behavior is not established.
 
-`/health` and `/api/v1/meta` expose sanitized host mode, origin and last-check information, never tokens. New schedules and receipts record the observed host binding. See [delivery status](docs/delivery-status.md) for admission, saved intake, reconciliation and cancellation semantics, and [services](docs/services.md) for maintenance and consistent backups.
+`/health` and `/api/v1/meta` expose sanitized host mode, origin and last-check information, never tokens. New schedules and receipts record the observed host binding. See [delivery status](delivery-status.md) for admission, saved intake, reconciliation and cancellation semantics, and [services](services.md) for maintenance and consistent backups.
